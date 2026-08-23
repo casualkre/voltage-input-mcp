@@ -302,19 +302,30 @@ def plan_steps(env: Environment, engine: str, profile: str) -> list[Step]:
                 "llama", "Get llama.cpp",
                 "faster than Ollama here, and the only backend that supports GBNF "
                 "grammars -- which is what keeps the small models reliable",
+                detail=(
+                    "Download a CUDA build and put llama-server.exe on your PATH:\n"
+                    "  https://github.com/ggml-org/llama.cpp/releases\n"
+                    "  (pick llama-<version>-bin-win-cuda-x64.zip)"
+                    if sys.platform == "win32" else "./scripts/build-llama.sh"
+                ),
                 automatic=sys.platform != "win32",
             ))
         if not env.model_files:
             steps.append(Step(
                 "weights", f"Download the {profile} weights",
                 "roughly 3 GB; one-time",
-                automatic=sys.platform != "win32",
+                detail=f"voltage fetch {profile}",
+                automatic=True,   # pure-Python downloader; works on every platform
             ))
         if not env.servers_up:
             steps.append(Step(
                 "serve", "Start the model servers",
                 "two llama-server instances, one per role",
-                automatic=sys.platform != "win32",
+                detail=(
+                    "voltage serve-models   # prints both commands, run each in a terminal"
+                    if sys.platform == "win32" else "./scripts/serve.sh " + profile
+                ),
+                automatic=True,
             ))
 
     if not env.claude_cli:

@@ -295,11 +295,21 @@ yourself.
 
 ## Install
 
-From nothing to working, two commands:
+From nothing to working, two commands.
+
+**Linux / macOS**
 
 ```bash
 git clone https://github.com/casualkre/voltage-input-mcp && cd voltage-input-mcp && ./install.sh
 ```
+
+**Windows** (PowerShell)
+
+```powershell
+git clone https://github.com/casualkre/voltage-input-mcp; cd voltage-input-mcp; powershell -ExecutionPolicy Bypass -File .\install.ps1
+```
+
+Then, on either:
 
 ```bash
 voltage setup

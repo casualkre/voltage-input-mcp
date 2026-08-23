@@ -343,6 +343,78 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if "error" not in report else 1
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """Download a profile's weights. Pure Python, so it works on every platform.
+
+    The shell script this replaces was fine on Linux and unusable on Windows, which meant
+    `voltage setup` could only print instructions there instead of doing the work.
+    """
+    import urllib.error
+    import urllib.request
+
+    from .llm import get_profile
+
+    try:
+        profile = get_profile(args.profile)
+    except KeyError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+
+    target = Path(args.dir) if args.dir else Path(__file__).resolve().parents[2] / "models"
+    target.mkdir(parents=True, exist_ok=True)
+
+    wanted: list[tuple[str, str]] = []
+    for spec in (profile.vision, profile.actuator):
+        if spec.hf_repo and spec.hf_file:
+            wanted.append((spec.hf_repo, spec.hf_file))
+        if spec.mmproj_repo and spec.mmproj_file:
+            wanted.append((spec.mmproj_repo, spec.mmproj_file))
+    if not wanted:
+        print(f"profile {args.profile!r} uses Ollama; nothing to download here")
+        print(f"  ollama pull {profile.vision.ollama_tag}")
+        print(f"  ollama pull {profile.actuator.ollama_tag}")
+        return 0
+
+    print(f"profile {profile.name}  ->  {target}\n")
+    for repo, name in wanted:
+        dest = target / name
+        if dest.exists() and dest.stat().st_size > 0:
+            print(f"  have    {name}  ({dest.stat().st_size / 2**30:.2f} GB)")
+            continue
+
+        url = f"https://huggingface.co/{repo}/resolve/main/{name}"
+        part = dest.with_suffix(dest.suffix + ".part")
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": "voltage-input-mcp"})
+            with urllib.request.urlopen(request, timeout=30) as response, part.open("wb") as out:
+                total = int(response.headers.get("Content-Length") or 0)
+                done = 0
+                while chunk := response.read(1 << 20):
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        pct = done * 100 // total
+                        print(f"\r  fetch   {name}  {pct:3d}%  "
+                              f"{done / 2**30:.2f}/{total / 2**30:.2f} GB", end="", flush=True)
+            print()
+        except urllib.error.HTTPError as exc:
+            part.unlink(missing_ok=True)
+            print(f"\n  MISSING {name}  (HTTP {exc.code})", file=sys.stderr)
+            print("          the repo or quant may have been renamed -- check", file=sys.stderr)
+            print(f"          https://huggingface.co/{repo}/tree/main", file=sys.stderr)
+            return 1
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            part.unlink(missing_ok=True)
+            print(f"\n  FAILED  {name}: {exc}", file=sys.stderr)
+            return 1
+        part.replace(dest)
+
+    size = sum(f.stat().st_size for f in target.glob("*.gguf"))
+    print(f"\n{size / 2**30:.2f} GB in {target}")
+    print(f"\nnext:  voltage serve-models {profile.name}     # prints the launch commands")
+    return 0
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Go from nothing to working, running each step rather than describing it."""
     import subprocess
@@ -411,9 +483,15 @@ def cmd_setup(args: argparse.Namespace) -> int:
         elif step.key == "llama":
             run(["./scripts/build-llama.sh"])
         elif step.key == "weights":
-            run(["./scripts/fetch-models.sh", config.profile])
+            # Python downloader rather than the shell script, so this step actually runs
+            # on Windows instead of printing instructions.
+            cmd_fetch(argparse.Namespace(profile=config.profile, dir=None))
         elif step.key == "serve":
-            run(["./scripts/serve.sh", config.profile])
+            if sys.platform == "win32":
+                print("\n  Start each of these in its own terminal:\n")
+                cmd_serve_models(argparse.Namespace(profile=config.profile))
+            else:
+                run(["./scripts/serve.sh", config.profile])
         elif step.key == "mcp":
             info = gather()
             command = claude_code_command(info)
@@ -601,6 +679,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("fetch", help="download a profile's model weights")
+    p.add_argument("profile", nargs="?", default="lean")
+    p.add_argument("--dir", help="where to put them (default: ./models)")
+    p.set_defaults(func=cmd_fetch)
 
     p = sub.add_parser("setup", help="go from nothing to working; safe to re-run")
     p.add_argument("-y", "--yes", action="store_true", help="do not ask before running")
