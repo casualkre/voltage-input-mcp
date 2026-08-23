@@ -1,0 +1,297 @@
+"""Command line interface.
+
+Exists mostly so the system can be debugged without an MCP client in the loop. `voltage
+doctor` and `voltage burst` in particular are the fastest way to find out whether input
+and capture work on a given machine.
+
+`voltage stop` is the emergency exit and is deliberately the simplest thing here: it
+writes a file. It works from another TTY, over SSH, or from a file manager, and needs
+nothing about the running process to still be healthy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from . import __version__
+from .config import load_config
+
+
+def _print(data: Any) -> None:
+    print(json.dumps(data, indent=2, default=str, ensure_ascii=False))
+
+
+# -- commands ------------------------------------------------------------------------------
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    from .app import get_app
+
+    report = asyncio.run(get_app(load_config(args.config)).doctor())
+    if args.json:
+        _print(report)
+        return 0 if report.get("ready") else 1
+
+    ok = "OK " if report.get("ready") else "NOT READY "
+    print(f"{ok}voltage-input-mcp {__version__}")
+    session = report["session"]
+    print(f"  session      {session['type']} / {session['desktop']}")
+    if session.get("warning"):
+        print(f"               {session['warning']}")
+
+    inp = report["input"]
+    print(f"  uinput       {'ok' if inp.get('ok') else 'FAIL -- ' + str(inp.get('reason'))}")
+    if inp.get("fix"):
+        print(f"               fix: {inp['fix']}")
+    print(f"  clipboard    {inp.get('clipboard_tool') or 'none (see note)'}")
+
+    cap = report["capture"]
+    health = cap.get("health", {})
+    latency = f"{health['latency_ms']}ms" if health.get("latency_ms") else ""
+    available = [k for k, v in cap["available"].items() if v]
+    print(
+        f"  capture      {cap.get('selected', '-')} "
+        f"{'ok' if health.get('ok') else 'FAIL'} {latency}"
+        f"  available={available}"
+    )
+    if health.get("note"):
+        print(f"               {health['note']}")
+    print(f"  screen       {report.get('screen') or 'not detected yet'}")
+    if cap.get("screen_note"):
+        print(f"               {cap['screen_note']}")
+
+    models = report["models"]
+    print(f"  vram         {models.get('vram_mb')} MB   profile={models['profile']['name']} "
+          f"needs~{models['profile']['estimated_vram_mb']} MB")
+    for role in ("vision", "actuator"):
+        info = models.get(role) or {}
+        mark = "ok" if info.get("ok") else "FAIL"
+        print(f"  {role:<12} {mark}  {info.get('model') or info.get('url', '')}")
+        if info.get("fix"):
+            print(f"               fix: {info['fix']}")
+    if models.get("warning"):
+        print(f"  warning      {models['warning']}")
+
+    for step in report.get("next_steps", []):
+        print(f"  ->  {step}")
+    return 0 if report.get("ready") else 1
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    from .safety import write_panic
+
+    path = write_panic(args.reason)
+    print(f"panic file written: {path}")
+    print("every running loop will stop within one cycle and release held input")
+    return 0
+
+
+def cmd_clear(args: argparse.Namespace) -> int:
+    from .safety import clear_panic
+
+    clear_panic()
+    print("panic file cleared")
+    return 0
+
+
+def cmd_capture(args: argparse.Namespace) -> int:
+    from .app import get_app
+    from .capture import encode_png
+
+    app = get_app(load_config(args.config))
+    frame = app.capture().grab()
+    out = Path(args.output)
+    out.write_bytes(encode_png(frame.pixels))
+    print(f"{frame.width}x{frame.height} via {frame.backend} -> {out}")
+    return 0
+
+
+def cmd_burst(args: argparse.Namespace) -> int:
+    from .app import get_app
+    from .models.burst import parse_burst
+
+    app = get_app(load_config(args.config))
+    screen = app.screen() if args.live else (1920, 1080)
+    try:
+        burst = parse_burst(args.burst, screen=screen)
+    except Exception as exc:  # noqa: BLE001
+        print(f"parse error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"parsed {len(burst)} action(s), ~{burst.duration_ms} ms")
+    for action in burst:
+        print(f"  {action.render()}")
+
+    if not args.live:
+        print("\n(dry run -- pass --live to actually inject)")
+        return 0
+
+    executor = app.executor()
+    executor.dry_run = False
+    app.devices().open()
+    report = executor.run(burst, label="cli")
+    _print(report.as_dict())
+    return 0 if report.ok else 1
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    from .models.playbook import playbook_from_dict
+
+    try:
+        data = json.loads(Path(args.playbook).read_text())
+    except (OSError, ValueError) as exc:
+        print(f"cannot read playbook: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        compiled = playbook_from_dict(data)
+    except Exception as exc:  # noqa: BLE001
+        print("INVALID", file=sys.stderr)
+        detail = getattr(exc, "context", {}) or {}
+        for err in detail.get("errors", [str(exc)]):
+            print(f"  error: {err}", file=sys.stderr)
+        for warn in detail.get("warnings", []):
+            print(f"  warn:  {warn}", file=sys.stderr)
+        return 1
+
+    print(f"OK  {compiled.spec.name}: {len(compiled.states)} states, "
+          f"{len(compiled.probe_ids)} probes, initial={compiled.spec.initial}")
+    for warn in compiled.warnings:
+        print(f"  warn: {warn}")
+    return 0
+
+
+def cmd_profiles(args: argparse.Namespace) -> int:
+    from .llm import PROFILES, detect_vram_mb, recommend
+    from .llm.profiles import DESKTOP_RESERVE_MB, usable_vram_mb
+
+    vram = detect_vram_mb()
+    budget = usable_vram_mb(vram) if vram else 0
+    if vram:
+        print(f"detected VRAM: {vram} MB")
+        print(f"usable:        {budget} MB  (reserving {DESKTOP_RESERVE_MB} MB for the desktop)")
+        print(f"recommended:   {recommend(vram).name}\n")
+    else:
+        print("no CUDA GPU detected\n")
+    for profile in PROFILES.values():
+        fits = "" if not vram else ("  fits" if profile.fits(budget) else "  TOO BIG")
+        print(f"{profile.name:<10} ~{profile.vram_mb:>5} MB{fits}   {profile.description}")
+        print(f"{'':<10} vision={profile.vision.label}  actuator={profile.actuator.label}")
+        if profile.notes:
+            print(f"{'':<10} {profile.notes}")
+        print()
+    return 0
+
+
+def cmd_serve_models(args: argparse.Namespace) -> int:
+    from .llm import get_profile
+
+    profile = get_profile(args.profile)
+    print(f"# {profile.name}: {profile.description}")
+    print(f"# estimated VRAM: {profile.vram_mb} MB\n")
+    print("# vision model")
+    print(" ".join(profile.vision.llama_server_args()) + " &\n")
+    print("# actuator model")
+    print(" ".join(profile.actuator.llama_server_args(cpu_only=profile.actuator_on_cpu)) + " &")
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    from .app import get_app
+    from .bench import format_report, run_benchmark
+
+    app = get_app(load_config(args.config))
+    vision, actuator = app.backends()
+
+    async def go():
+        return await run_benchmark(vision, actuator, rounds=args.rounds)
+
+    report = asyncio.run(go())
+    if args.json:
+        _print(report)
+    else:
+        print(format_report(report))
+    return 0 if "error" not in report else 1
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    from .server import main as serve_main
+
+    serve_main()
+    return 0
+
+
+# -- parser --------------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="voltage",
+        description="VoltageInputMcp -- two-layer local input engine",
+    )
+    parser.add_argument("--version", action="version", version=f"voltage {__version__}")
+    parser.add_argument("--config", type=Path, default=None, help="path to voltage.toml")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="check that everything needed for a run works")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("stop", help="emergency stop: halt every running loop")
+    p.add_argument("reason", nargs="?", default="manual stop")
+    p.set_defaults(func=cmd_stop)
+
+    p = sub.add_parser("clear", help="clear the panic file so runs can start again")
+    p.set_defaults(func=cmd_clear)
+
+    p = sub.add_parser("capture", help="save a screenshot")
+    p.add_argument("-o", "--output", default="screen.png")
+    p.set_defaults(func=cmd_capture)
+
+    p = sub.add_parser("burst", help="parse (and optionally execute) a burst string")
+    p.add_argument("burst")
+    p.add_argument("--live", action="store_true", help="actually inject the input")
+    p.set_defaults(func=cmd_burst)
+
+    p = sub.add_parser("validate", help="validate a playbook JSON file")
+    p.add_argument("playbook", type=Path)
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("profiles", help="list model profiles and what fits this GPU")
+    p.set_defaults(func=cmd_profiles)
+
+    p = sub.add_parser("serve-models", help="print the llama-server commands for a profile")
+    p.add_argument("profile", nargs="?", default="lean")
+    p.set_defaults(func=cmd_serve_models)
+
+    p = sub.add_parser("bench", help="measure real model latency against running servers")
+    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("serve", help="run the MCP server on stdio")
+    p.set_defaults(func=cmd_serve)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args) or 0)
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+    except Exception as exc:  # noqa: BLE001
+        print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

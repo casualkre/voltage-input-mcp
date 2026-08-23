@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The suite is deliberately free of GPU, model and display-server dependencies:
+      # capture and the model backends are stubbed, and uinput is only exercised at the
+      # struct/ioctl encoding level. So CI on a headless runner is meaningful rather than
+      # a formality.
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Validate bundled playbooks
+        run: |
+          for pb in examples/*.json; do
+            python -m voltage_input_mcp.cli validate "$pb"
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check src tests

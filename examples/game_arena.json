@@ -1,0 +1,160 @@
+{
+  "name": "arena_fight",
+  "goal": "Fight through an arena wave. Keep moving, attack when an enemy is in range, heal when health drops. Never open a menu, never quit, never confirm anything.",
+  "initial": "engage",
+
+  "vars": { "waves_cleared": 0, "heals_used": 0 },
+
+  "_comment_policy": "Games are the case where an allowlist beats a denylist. This policy names the exact keys the game uses; every other key is not merely refused, it is absent from the actuator's grammar and cannot be generated. Note there is no 'esc' - the actuator physically cannot open the pause menu.",
+  "policy": {
+    "dry_run": true,
+    "allow_verbs": ["k", "d", "u", "c", "p", "e", "r", "w"],
+    "allow_keys": ["w", "a", "s", "d", "space", "shift", "q", "e", "1", "2", "3"],
+    "max_actions_per_burst": 24,
+    "max_burst_ms": 900,
+    "max_inputs_per_second": 90,
+    "max_hold_ms": 2500,
+    "allow_held_keys": true,
+    "require_target_element": false
+  },
+
+  "budget": {
+    "max_cycles": 400,
+    "max_seconds": 300,
+    "max_rejections": 20,
+    "idle_abort_s": 15,
+    "deadman_s": 4
+  },
+
+  "_comment_perception": "Perception is deliberately starved. A 3B VLM at 300ms cannot keep up with combat, so the vision model runs only every 4th cycle to answer slow questions ('is a boss on screen', 'did a loot window open'), and the fast loop is driven entirely by probes and reflexes.",
+  "perception": {
+    "mode": "cadence",
+    "cadence": 4,
+    "max_elements": 3,
+    "read_text": false,
+    "downscale_to": [640, 360]
+  },
+
+  "_comment_probes": "Probes read the HUD directly. Each costs microseconds, so they can drive reflexes at full loop rate with no model involved. Coordinates are for a 1920x1080 layout - use voltage_capture to find the real ones for your game.",
+  "probes": [
+    {
+      "id": "health",
+      "type": "region_mean",
+      "region": { "x": 120, "y": 1010, "w": 8, "h": 20 },
+      "expect": "#c0392b",
+      "tolerance": 60,
+      "channel": "r"
+    },
+    {
+      "id": "health_low",
+      "type": "region_mean",
+      "region": { "x": 300, "y": 1010, "w": 8, "h": 20 },
+      "expect": "#c0392b",
+      "tolerance": 60,
+      "channel": "r"
+    },
+    {
+      "id": "screen_motion",
+      "type": "region_diff",
+      "region": { "x": 460, "y": 200, "w": 1000, "h": 600 }
+    },
+    {
+      "id": "danger_flash",
+      "type": "brightness",
+      "region": { "x": 700, "y": 400, "w": 520, "h": 280 }
+    }
+  ],
+
+  "states": {
+    "engage": {
+      "brief": "Fight. Strafe while attacking. Keep the enemy in front of you.",
+      "hint": "Chain movement and attacks into one burst - hold a direction, attack twice, release. Do not emit single keypresses.",
+      "watch": ["enemy", "boss", "loot window"],
+      "allow_verbs": ["k", "d", "u", "c", "w", "r"],
+
+      "_comment_reflex": "Reflexes fire between actuator decisions with no model in the path. 'heal' beats 'dodge' on priority, and both are exclusive so they suppress the actuator for that cycle.",
+      "reflex": [
+        {
+          "id": "heal",
+          "when": "probe('health_low') < 0.5",
+          "do": "k:q;w:80",
+          "cooldown_ms": 2500,
+          "priority": 10,
+          "exclusive": true
+        },
+        {
+          "id": "dodge",
+          "when": "probe('danger_flash') > 0.72",
+          "do": "d:shift;k:s;w:120;u:shift",
+          "cooldown_ms": 600,
+          "priority": 5,
+          "exclusive": true
+        },
+        {
+          "id": "unstick",
+          "when": "stalled(2.5)",
+          "do": "d:a;w:250;u:a;k:space",
+          "cooldown_ms": 3000,
+          "priority": 1,
+          "exclusive": false
+        }
+      ],
+
+      "transitions": [
+        { "when": "probe('health') < 0.15", "to": "retreat", "note": "critical health" },
+        { "when": "sees('loot window')", "to": "collect", "inc": { "waves_cleared": 1 } },
+        { "when": "sees('boss')", "to": "boss_fight" }
+      ]
+    },
+
+    "retreat": {
+      "brief": "Back away from the fight and heal. Do not attack.",
+      "hint": "Hold S to move backwards. Press Q to heal when it is off cooldown.",
+      "watch": ["enemy", "boss"],
+      "allow_verbs": ["k", "d", "u", "w"],
+      "on_enter": "d:s;w:400;u:s",
+      "timeout_s": 12,
+      "on_timeout": "engage",
+      "transitions": [
+        { "when": "probe('health') > 0.55", "to": "engage", "inc": { "heals_used": 1 } },
+        { "when": "not sees('enemy') and not sees('boss')", "to": "engage" }
+      ]
+    },
+
+    "boss_fight": {
+      "brief": "Fight the boss. Attack in short bursts, then reposition.",
+      "hint": "Do not stand still. Every attack burst should end with movement.",
+      "watch": ["boss", "loot window"],
+      "reflex": [
+        {
+          "id": "boss_heal",
+          "when": "probe('health_low') < 0.6",
+          "do": "k:q;w:80",
+          "cooldown_ms": 2000,
+          "priority": 10,
+          "exclusive": true
+        }
+      ],
+      "transitions": [
+        { "when": "sees('loot window')", "to": "collect" },
+        { "when": "probe('health') < 0.2", "to": "retreat" }
+      ]
+    },
+
+    "collect": {
+      "brief": "Pick up the loot, then close the window.",
+      "watch": ["loot window", "item"],
+      "allow_verbs": ["k", "c", "r", "w"],
+      "max_cycles": 8,
+      "on_timeout": "engage",
+      "transitions": [
+        { "when": "not sees('loot window') and vars.waves_cleared >= 3", "to": "@success" },
+        { "when": "not sees('loot window')", "to": "engage" }
+      ]
+    }
+  },
+
+  "failure_when": "rejections() > 15",
+
+  "notes": "Set dry_run to false only after checking voltage_journal shows sensible bursts. Probe coordinates are display-specific: run voltage_capture, find your health bar, and edit the regions. The user can stop this at any moment by touching the real mouse or keyboard."
+}

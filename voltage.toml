@@ -1,0 +1,99 @@
+# VoltageInputMcp configuration.
+#
+# Copy to ~/.config/voltage-input-mcp/voltage.toml to activate, or point at it with
+# `voltage --config ./voltage.toml`. Every key can also be set from the environment as
+# VOLTAGE_<KEY>, which wins over the file.
+#
+# Everything here has a working default. The values shown are the defaults.
+
+[voltage]
+
+# ---------------------------------------------------------------------------- models
+
+# Which model profile to load. `voltage profiles` shows what fits this GPU, accounting
+# for the ~900 MB the desktop compositor is already holding.
+#   lean      Qwen2.5-VL-3B + Qwen3-1.7B      ~4.5 GB   the 6 GB target
+#   balanced  Qwen2.5-VL-3B + Qwen3-4B        ~6.0 GB   better instruction following
+#   split     vision on GPU, actuator on CPU  ~3.3 GB   when VRAM is very tight
+#   quality   Qwen2.5-VL-7B + Qwen3-4B        ~9.0 GB   dense or unusual UI
+#   ollama    same models via Ollama                    zero build, no GBNF, ~2x slower
+profile = "lean"
+
+# "llamacpp" or "ollama".
+#
+# llamacpp is strongly preferred. It supports GBNF grammars, which is what makes a 1.7B
+# actuator reliable: a malformed burst, a denied key, or an undeclared state transition
+# becomes structurally unrepresentable rather than merely unlikely. Ollama can only
+# constrain to a JSON schema, so on that path the burst string itself is unconstrained
+# and a bad one costs a cycle.
+engine = "llamacpp"
+
+vision_url = "http://127.0.0.1:8080"
+actuator_url = "http://127.0.0.1:8081"
+ollama_url = "http://127.0.0.1:11434"
+
+# --------------------------------------------------------------------------- capture
+
+# "auto" | "portal" | "kwin" | "grim" | "x11"
+#
+# auto probes each and picks the first that genuinely works. On KDE Wayland that is
+# "portal": KWin authorises its own ScreenShot2 interface against an allowlist of
+# executables, so a third-party process always gets NoAuthorized, and grim needs
+# wlr-screencopy which KWin does not implement.
+#
+# The portal shows a screen-share picker the first time. The grant is persisted via a
+# restore token in ~/.local/state/voltage-input-mcp/, so it is asked once, not per run.
+capture_backend = "auto"
+
+# Include the mouse cursor in captures. Usually worth it -- the vision model can see
+# where the pointer is, which helps it judge whether the last move landed.
+capture_cursor = true
+
+# ----------------------------------------------------------------------------- input
+
+# "auto" | "keys" | "clipboard"
+#
+# uinput injects scancodes, so typed characters depend on the compositor's active XKB
+# layout. On a non-US layout, punctuation typed as scancodes comes out wrong -- silently.
+# "auto" routes plain short ASCII through keystrokes and everything else (unicode,
+# accented characters, long strings) through the clipboard, which is layout-independent
+# and O(1) rather than O(len) in wall time. Needs wl-clipboard or xclip.
+text_mode = "auto"
+
+# "absolute" | "relative"
+#
+# Absolute is correct for desktop UI. Switch to relative if `voltage_calibrate` shows the
+# cursor not moving -- that means libinput classified the virtual pointer in a way the
+# compositor ignores for absolute motion. Games with pointer lock generally want relative.
+pointer_mode = "absolute"
+
+# Desktop geometry. Leave unset to detect it from a capture. Set as [width, height] only
+# if detection gets it wrong on a multi-monitor layout.
+# screen = [1920, 1080]
+
+# ------------------------------------------------------------------------ run defaults
+
+# Never inject input unless a run explicitly opts in. A dry run parses, safety-checks and
+# journals every burst while touching nothing, which is how a new playbook should always
+# be tested first. Leaving this true means a mistake in a playbook is inert by default.
+dry_run = true
+
+# Target loop period in seconds. 0.5 (2 Hz) suits desktop work. Lower it for games; the
+# loop degrades gracefully rather than falling behind if a cycle overruns.
+target_period_s = 0.5
+
+# Pause after a burst before looking again, so the UI has caught up with what just
+# happened. Too low and the vision model reads a half-drawn frame.
+settle_ms = 60
+
+# Save a PNG per cycle alongside the journal. Off by default: a three-minute run at 2 Hz
+# is ~360 screenshots. Turn on when diagnosing why a run clicked the wrong thing.
+keep_frames = false
+
+# Stop the run when the user touches the real keyboard or mouse. This is the stop people
+# actually reach for. It needs read access to /dev/input/event*, i.e. membership of the
+# `input` group; without that it degrades to unavailable and says so in `voltage doctor`.
+watch_physical_input = true
+
+# More than one autonomous run driving the same keyboard is not a thing anybody wants.
+max_concurrent_runs = 1

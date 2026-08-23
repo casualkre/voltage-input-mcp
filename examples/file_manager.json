@@ -1,0 +1,80 @@
+{
+  "name": "open_downloads_in_dolphin",
+  "goal": "Open the KDE file manager and navigate to ~/Downloads. Delete nothing, confirm nothing, approve nothing.",
+  "initial": "launch",
+
+  "vars": { "attempts": 0 },
+
+  "_comment_policy": "Desktop automation is where deny_labels earns its keep: a confirmation dialog can appear anywhere, so refusing clicks on anything *called* Delete/Confirm/Empty Trash is more reliable than fencing off screen regions.",
+  "policy": {
+    "dry_run": true,
+    "allow_verbs": ["g", "c", "k", "t", "w", "m"],
+    "deny_labels": [
+      "delete", "trash", "remove", "confirm", "empty trash",
+      "move to trash", "permanently delete", "apply", "yes"
+    ],
+    "deny_text": ["rm\\s+-[rf]", "\\bsudo\\b", "\\bmkfs\\b"],
+    "require_target_element": false,
+    "max_actions_per_burst": 12,
+    "max_inputs_per_second": 40
+  },
+
+  "budget": {
+    "max_cycles": 60,
+    "max_seconds": 90,
+    "max_rejections": 6,
+    "idle_abort_s": 20
+  },
+
+  "perception": {
+    "mode": "on_change",
+    "change_threshold": 0.015,
+    "max_elements": 5,
+    "read_text": true,
+    "downscale_to": [896, 504]
+  },
+
+  "states": {
+    "launch": {
+      "brief": "Open the application launcher and start the file manager.",
+      "hint": "The launcher is already opening. Type into it; do not click first.",
+      "watch": ["application launcher", "search field", "file manager icon"],
+      "on_enter": "k:meta;w:450",
+      "transitions": [
+        { "when": "sees('search field') or sees('application launcher')", "to": "type_name" },
+        { "when": "cycles() > 6", "to": "@failure", "note": "launcher never appeared" }
+      ]
+    },
+
+    "type_name": {
+      "brief": "Type 'dolphin' and press Enter to launch the file manager.",
+      "hint": "The search field already has focus.",
+      "watch": ["search field", "file manager icon", "file list", "window"],
+      "transitions": [
+        {
+          "when": "sees('file list')",
+          "to": "navigate",
+          "inc": { "attempts": 1 },
+          "note": "file manager is open"
+        },
+        { "when": "cycles() > 10", "to": "@failure", "note": "file manager never opened" }
+      ]
+    },
+
+    "navigate": {
+      "brief": "Press ctrl+l, type the Downloads path, press Enter.",
+      "hint": "ctrl+l has already been pressed and the location bar has focus. Just type the path.",
+      "watch": ["location bar", "file list", "error message", "dialog"],
+      "on_enter": "k:ctrl+l;w:250",
+      "transitions": [
+        { "when": "text('Downloads')", "to": "@success" },
+        { "when": "sees('error message') or sees('dialog')", "to": "@failure" },
+        { "when": "cycles() > 10", "to": "@failure", "note": "navigation stalled" }
+      ]
+    }
+  },
+
+  "success_when": "text('Downloads') and not flag('loading')",
+
+  "notes": "Written for KDE Plasma. On GNOME change launch.on_enter to k:meta and the labels to match the Activities overview; on XFCE use k:meta or the applications menu. Run with dry_run first and read voltage_journal - if the vision model never reports 'search field', try 'text input' or 'search box' instead."
+}

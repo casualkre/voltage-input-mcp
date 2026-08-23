@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "voltage-input-mcp"
+version = "0.1.0"
+description = "Two-layer MCP input engine: a frontier model orchestrates, two small local models chain the inputs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    # 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+    "mcp>=2.0.0",
+    "pydantic>=2.7",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+# PyGObject is intentionally NOT a pip dependency: on Arch/CachyOS it must come
+# from the distro (python-gobject) so it matches the system GLib/GStreamer ABI.
+# scripts/setup.sh installs it via pacman and builds the venv with
+# --system-site-packages so `gi` is importable.
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+voltage = "voltage_input_mcp.cli:main"
+voltage-input-mcp = "voltage_input_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/voltage_input_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/voltage_input_mcp/grammars" = "voltage_input_mcp/grammars"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Pinned explicitly so CI is deterministic across ruff releases rather than drifting
+# with whatever the default rule set happens to be.
+select = [
+    "F",    # pyflakes: real errors -- undefined names, broken __all__, dead imports
+    "E4", "E7", "E9",
+    "I",    # import ordering
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "C4",   # comprehensions
+    "SIM",  # simplifications
+]
+ignore = [
+    # Broad `except Exception` is load-bearing here: telemetry, health checks, guard
+    # evaluation and the killswitch must never propagate an exception into the run loop
+    # or the cleanup path. Each site says so in a comment.
+    "B904",
+    "SIM105",  # contextlib.suppress is not clearer than try/except/pass in hot paths
+    # CaptureBackend.start/stop and Backend.close are deliberately optional hooks with a
+    # no-op default. Making them abstract would force every backend to implement methods
+    # most of them have no use for.
+    "B027",
+    # The AST node counter is a budget check that must read the count before the loop
+    # body runs; enumerate() would invert that.
+    "SIM113",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests deliberately assert on private encoding constants and use bare asserts.
+"tests/*" = ["B011", "SIM117"]
