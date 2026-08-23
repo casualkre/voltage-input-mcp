@@ -7,3 +7,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 screen.png
+
+# eval fixtures are real screenshots of your desktop -- keep them local
+fixtures/

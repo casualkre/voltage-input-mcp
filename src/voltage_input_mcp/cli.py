@@ -16,7 +16,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any  # noqa: F401  -- used by annotations in the command handlers
 
 from . import __version__
 from .config import load_config
@@ -166,6 +166,128 @@ def cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _results_path() -> Path:
+    from .config import state_dir
+
+    return state_dir() / "comparisons.json"
+
+
+def cmd_fixture(args: argparse.Namespace) -> int:
+    """Capture the screen and write a fixture stub for the orchestrator to annotate."""
+    from .app import get_app
+    from .capture import encode_png
+
+    app = get_app(load_config(args.config))
+    frame = app.capture().grab()
+    out_dir = Path(args.dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    png = out_dir / f"{args.name}.png"
+    meta = out_dir / f"{args.name}.json"
+
+    png.write_bytes(encode_png(frame.pixels))
+    if meta.exists() and not args.force:
+        print(f"{meta} already exists (use --force to overwrite the labels)")
+    else:
+        meta.write_text(json.dumps({
+            "name": args.name,
+            "screen": list(frame.size),
+            "watch": ["<label the vision model may use>", "<another>"],
+            "expect": {"<label>": [0, 0, 100, 40]},
+            "absent": [],
+            "_howto": (
+                "Open the PNG, or have the orchestrator view it with voltage_capture, "
+                "then fill `expect` with label -> [x, y, w, h] in screen pixels and list "
+                "any labels that must NOT be detected under `absent`. The orchestrator is "
+                "the reference here -- it is the same model that judges the screen at "
+                "runtime."
+            ),
+        }, indent=2))
+        print(f"wrote {meta}")
+    print(f"wrote {png}  ({frame.width}x{frame.height} via {frame.backend})")
+    return 0
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Evaluate the currently-running models and accumulate results across runs."""
+    from .app import get_app
+    from .evaluate import Fixture, compare_actuator, compare_vision, format_actuator, format_vision
+
+    store = _results_path()
+    saved: dict[str, Any] = {}
+    if store.exists():
+        try:
+            saved = json.loads(store.read_text())
+        except ValueError:
+            saved = {}
+
+    if args.reset:
+        store.unlink(missing_ok=True)
+        print("cleared accumulated comparison results")
+        return 0
+
+    if not args.list:
+        app = get_app(load_config(args.config))
+        vision, actuator = app.backends()
+
+        async def go() -> dict[str, Any]:
+            health = await vision.health()
+            label = args.label or str(
+                health.get("model") or getattr(vision, "model_label", "unknown")
+            )
+            label = Path(str(label)).name
+
+            fixtures = []
+            fixture_dir = Path(args.fixtures)
+            if fixture_dir.is_dir():
+                fixtures = [
+                    Fixture.load(p) for p in sorted(fixture_dir.glob("*.json"))
+                    if p.with_suffix(".png").exists()
+                ]
+
+            entry: dict[str, Any] = {"profile": app.config.profile, "engine": app.config.engine}
+            if fixtures:
+                entry["vision"] = (await compare_vision(
+                    {label: vision}, fixtures, rounds=args.rounds
+                ))[label]
+            else:
+                print(
+                    f"no fixtures in {fixture_dir}/ -- skipping grounding accuracy.\n"
+                    f"Create one with:  voltage fixture desktop --dir {fixture_dir}\n"
+                    f"then have the orchestrator fill in the expected boxes.\n"
+                )
+            entry["actuator"] = (await compare_actuator(
+                {label: actuator}, rounds=args.rounds
+            ))[label]
+            return {label: entry}
+
+        result = asyncio.run(go())
+        saved.update(result)
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps(saved, indent=2, default=str))
+        print(f"results saved to {store}\n")
+
+    if not saved:
+        print("no results yet. Start a model with scripts/serve.sh, then run this again.")
+        return 1
+
+    if args.json:
+        _print(saved)
+        return 0
+
+    vision_results = {k: v["vision"] for k, v in saved.items() if "vision" in v}
+    actuator_results = {k: v["actuator"] for k, v in saved.items() if "actuator" in v}
+    if vision_results:
+        print(format_vision(vision_results))
+    if actuator_results:
+        print(format_actuator(actuator_results))
+    print(
+        "  To compare model sizes: stop the servers, edit `profile` in voltage.toml or\n"
+        "  run scripts/serve.sh with another profile, then run `voltage compare` again.\n"
+        "  Results accumulate, so the table grows with each model you try.\n"
+    )
+    return 0
+
+
 def cmd_profiles(args: argparse.Namespace) -> int:
     from .llm import PROFILES, detect_vram_mb, recommend
     from .llm.profiles import DESKTOP_RESERVE_MB, usable_vram_mb
@@ -268,6 +390,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve-models", help="print the llama-server commands for a profile")
     p.add_argument("profile", nargs="?", default="lean")
     p.set_defaults(func=cmd_serve_models)
+
+    p = sub.add_parser("fixture", help="capture a screenshot as a grounding-eval fixture")
+    p.add_argument("name")
+    p.add_argument("--dir", default="fixtures")
+    p.add_argument("--force", action="store_true", help="overwrite existing labels")
+    p.set_defaults(func=cmd_fixture)
+
+    p = sub.add_parser(
+        "compare",
+        help="score the running models on grounding + decision quality; accumulates",
+    )
+    p.add_argument("--label", help="name for this model in the table (default: from /props)")
+    p.add_argument("--fixtures", default="fixtures", help="directory of eval fixtures")
+    p.add_argument("--rounds", type=int, default=3)
+    p.add_argument("--list", action="store_true", help="print the table without running")
+    p.add_argument("--reset", action="store_true", help="clear accumulated results")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("bench", help="measure real model latency against running servers")
     p.add_argument("--rounds", type=int, default=5)

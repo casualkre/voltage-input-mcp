@@ -180,6 +180,37 @@ prompt-cached latency, ms-per-visual-token at three input sizes, and the cycle t
 imply. A prompt-cache speedup below ~1.5× means something dynamic leaked into the prompt
 prefix.
 
+## Comparing models
+
+The obvious experiment — "which model writes better bursts" — measures the wrong thing.
+The grammar already guarantees every burst is *valid*, so a bigger model cannot win on
+syntax. What actually decides whether a configuration is usable:
+
+1. **Grounding accuracy.** A model that's 200 ms faster and 40 px off is useless — the
+   click misses. Measured as centre distance in screen pixels, not IoU, because a click
+   lands at the centre.
+2. **Decision quality under constraint.** Given the same observation, does it pick the
+   *right* legal action, and does it chain a whole sequence into one burst rather than
+   emitting one timid action per cycle?
+3. **Latency**, which only matters once 1 and 2 are acceptable.
+
+```bash
+.venv/bin/voltage fixture desktop      # capture a real screen
+.venv/bin/voltage compare              # score whatever is running now
+```
+
+Ground truth comes from **real screenshots labelled by the orchestrating model** — which
+is the same reference this system uses at runtime. Synthetic UI is a trap: a drawn
+rectangle doesn't read as a button to a model trained on real interfaces, so scoring
+against it measures the wrong skill.
+
+Results accumulate across runs, so the workflow is: serve profile A → `compare` → serve
+profile B → `compare` → read the table. `voltage compare --list` prints it without
+re-running.
+
+Fixtures are yours and not committed. Add `fixtures/` to `.gitignore` if your screenshots
+contain anything private.
+
 ## Safety
 
 The thing generating inputs is a 1.7B model. The governor is the layer that is not
