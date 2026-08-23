@@ -43,6 +43,7 @@ import struct
 import time
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Final
 
 from ..errors import InputDeviceError
@@ -408,12 +409,47 @@ def probe_uinput() -> dict[str, object]:
             # module; when autoload does not happen, open() fails with ENODEV rather
             # than ENOENT. Checking only for the file's existence therefore reports a
             # healthy device that cannot accept a single event.
-            result["reason"] = (
-                "the uinput device node exists but the kernel module is not loaded "
-                "(ENODEV). Input injection will fail until it is."
-            )
-            result["fix"] = (
-                "sudo modprobe uinput   "
-                "(persist with: echo uinput | sudo tee /etc/modules-load.d/uinput.conf)"
-            )
+            result.update(_diagnose_enodev())
     return result
+
+
+def _diagnose_enodev() -> dict[str, object]:
+    """Tell apart "module not loaded" from "no modules can load at all".
+
+    On a rolling distribution the second case is common and the first fix is actively
+    wrong for it: installing a kernel update removes the running kernel's module tree, so
+    `modprobe uinput` fails with "Module not found" and looks like uinput is unavailable.
+    Nothing is loadable until reboot, and telling someone to modprobe harder does not
+    help them.
+    """
+    import platform
+
+    release = platform.release()
+    modules_dir = Path(f"/lib/modules/{release}")
+
+    if not modules_dir.is_dir():
+        available = sorted(
+            p.name for p in Path("/lib/modules").glob("*") if p.is_dir()
+        ) if Path("/lib/modules").is_dir() else []
+        newer = [v for v in available if v != release]
+        return {
+            "reason": (
+                f"no modules can be loaded: the running kernel is {release}, but "
+                f"/lib/modules/{release} does not exist. A kernel update since boot "
+                f"replaced it"
+                + (f" (installed now: {', '.join(newer)})" if newer else "")
+                + "."
+            ),
+            "fix": "sudo reboot   -- then input injection works with no further setup",
+        }
+
+    return {
+        "reason": (
+            "the uinput device node exists but the kernel module is not loaded (ENODEV). "
+            "Input injection will fail until it is."
+        ),
+        "fix": (
+            "sudo modprobe uinput   "
+            "(persist with: echo uinput | sudo tee /etc/modules-load.d/uinput.conf)"
+        ),
+    }
