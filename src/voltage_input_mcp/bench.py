@@ -210,7 +210,7 @@ def format_report(report: dict[str, Any]) -> str:
     if act.get("sample_output"):
         lines.append(f"  sample                   {act['sample_output']!r}")
 
-    lines += ["", "VISION (prefill-bound; scales with visual tokens)"]
+    lines += ["", "VISION (decode-bound; scales with OUTPUT tokens, not image size)"]
     lines.append(f"  {'size':<12}{'tokens':>7}{'median':>10}{'prefill':>10}{'ms/token':>10}")
     for key, data in report["vision"].items():
         if not isinstance(data, dict) or "visual_tokens" not in data:
@@ -236,13 +236,16 @@ def format_report(report: dict[str, Any]) -> str:
     lines += [
         "",
         "TUNING",
-        "  - Vision latency is close to linear in visual tokens. Dropping",
-        "    perception.downscale_to from 896x504 to 700x392 removes 39% of them.",
-        "  - If ms/token is far worse at 896x504 than at 448x252, the image is being",
-        "    split across micro-batches: raise ubatch_size in llm/profiles.py.",
+        "  - Prefill is small and roughly flat across image sizes; decode dominates.",
+        "    If a SMALLER image is slower here, that is expected, not a bug: a blurrier",
+        "    screenshot makes the model less certain and it emits more tokens.",
+        "  - The real vision knob is perception.max_elements. Each reported element is",
+        "    ~21 output tokens, so roughly 500 ms. Set it to the number of things your",
+        "    guards actually test for.",
+        "  - The real actuator knob is output length. The diagnostic note costs real",
+        "    time: 48 chars measured 412 ms/cycle against 184 ms at 12.",
         "  - A prompt-cache speedup below ~1.5x means the cache is not being reused.",
-        "    Check that --cache-reuse is set and that nothing dynamic leaked into the",
-        "    prompt prefix.",
+        "    Check --cache-reuse and that nothing dynamic leaked into the prompt prefix.",
         "",
     ]
     return "\n".join(lines)
