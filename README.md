@@ -286,6 +286,37 @@ non-interactively, so scripts and CI are unaffected.
    ok   voltage on PATH   ~/.local/bin/voltage
 ```
 
+### Experimental profiles
+
+Listed separately in `voltage` → models, each behind a warning you must accept. They exist
+because the measurements make the trade-offs predictable: decode dominates at ~22 ms/token
+and scales with active parameters, so shrinking the models really does raise the loop rate.
+What it costs is grounding.
+
+| profile | models | VRAM | trade |
+|---|---|---|---|
+| `hyper` | SmolVLM-500M + Qwen3-0.6B | ~2.2 GB | 3–4× the loop rate, **grounding barely works** |
+| `fast` | Qwen2.5-VL-3B + Qwen3-0.6B | ~3.8 GB | faster decisions, grounding unchanged |
+| `beefy` | Qwen2.5-VL-32B + Qwen3-14B | ~34 GB | best grounding, 1–2.5 s/cycle |
+| `beefy_moe` | Qwen2.5-VL-32B + Qwen3-30B-A3B | ~43 GB | 30B capacity at ~3B decode speed |
+| `cpu_only` | 3B + 0.6B on CPU | none | works without a GPU, seconds per cycle |
+
+Two worth singling out:
+
+**`hyper` is the dangerous one.** SmolVLM-500M is not a grounding model. It *will* return
+boxes and they *will* often be wrong — and a wrong box is a click in the wrong place, not a
+graceful degradation. Only use it where `watch` is empty (probes and reflexes doing the
+real work) or where every click is fenced by `click_allow_regions` and
+`require_target_element`.
+
+**`beefy_moe` is the interesting one.** Qwen3-30B-A3B is a mixture of experts with ~3B
+*active* parameters, so it decodes at roughly 3B speed while reasoning with 30B capacity —
+and decode is precisely what bottlenecks this loop. A much better actuator than a dense
+14B at similar latency. The catch is memory: only the active experts are fast, not the
+weights, so all 30B still has to be resident.
+
+`recommend()` never returns an experimental profile, and a test enforces that.
+
 ### Custom model profiles
 
 The built-in profiles cover the machines this was developed against, not yours. Add your

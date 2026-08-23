@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
+from .profiles import EXPERIMENTAL, ModelSpec, Profile
 from .profiles import PROFILES as BUILTIN
-from .profiles import ModelSpec, Profile
 
 __all__ = [
     "profiles_path", "load_custom", "save_custom", "delete_custom",
@@ -98,12 +98,16 @@ def load_custom(path: Path | None = None) -> dict[str, Profile]:
 
 
 def all_profiles() -> dict[str, Profile]:
-    """Built-ins with custom profiles merged over the top.
+    """Every profile: stable, experimental, and custom, in that precedence order.
 
     Custom wins on a name collision, deliberately: shadowing `lean` is the natural way to
     retune it for your own hardware without forking the package.
+
+    Experimental profiles are included here so `get_profile` and the serve scripts can
+    use them by name, but `recommend()` skips them -- each trades something away that
+    should be an explicit choice rather than a default.
     """
-    merged = dict(BUILTIN)
+    merged = {**BUILTIN, **EXPERIMENTAL}
     try:
         merged.update(load_custom())
     except ConfigError:

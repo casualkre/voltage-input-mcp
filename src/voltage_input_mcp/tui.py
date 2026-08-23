@@ -472,13 +472,32 @@ def screen_models(state: dict[str, object]) -> None:
                   f"{dim(f'(reserving {DESKTOP_RESERVE_MB} MB for the desktop)')}")
             print(f"  recommended profile: {green(recommend(vram).name)}\n")
 
-        for i, profile in enumerate(all_profiles().values(), 1):
-            mark = "*" if profile.name == config.profile else " "
-            fit = "" if not vram else (
-                green("  fits") if profile.fits(budget) else red("  too big")
+        from .llm.profiles import EXPERIMENTAL
+
+        ordered = list(all_profiles().values())
+        stable = [p for p in ordered if p.name not in EXPERIMENTAL]
+        experimental = [p for p in ordered if p.name in EXPERIMENTAL]
+
+        def show(profile, position: int, current: str, budget_mb: int | None) -> None:
+            mark = "*" if profile.name == current else " "
+            fit = "" if budget_mb is None else (
+                green("  fits") if profile.fits(budget_mb) else red("  too big")
             )
-            print(f"  {mark}{i}. {bold(profile.name):<18} ~{profile.vram_mb:>5} MB{fit}")
+            print(f"  {mark}{position}. {bold(profile.name):<12} ~{profile.vram_mb:>6} MB{fit}")
             print(f"      {dim(profile.description)}")
+
+        budget_mb = budget if vram else None
+        index = 0
+        for profile in stable:
+            index += 1
+            show(profile, index, config.profile, budget_mb)
+        if experimental:
+            print()
+            print(f"  {yellow('experimental')} "
+                  f"{dim('-- each trades something away; read the warning')}")
+            for profile in experimental:
+                index += 1
+                show(profile, index, config.profile, budget_mb)
         print()
         print(f"  running: vision {ok_mark(state['vision'])} actuator {ok_mark(state['actuator'])}")
         print()
@@ -488,13 +507,15 @@ def screen_models(state: dict[str, object]) -> None:
         choice = ask("choice").lower()
         if choice in ("q", ""):
             return
-        if choice.isdigit() and 1 <= int(choice) <= len(all_profiles()):
-            name = list(all_profiles())[int(choice) - 1]
-            config = _write_config(config, profile=name)
+        if choice.isdigit() and 1 <= int(choice) <= index:
+            profile = (stable + experimental)[int(choice) - 1]
+            if not _accept_profile(profile, budget if vram else None):
+                continue
+            config = _write_config(config, profile=profile.name)
             state["config"] = config
-            print(green(f"  profile set to {name}"))
+            print(green(f"  profile set to {profile.name}"))
             if confirm("fetch its weights now?", default=True):
-                run(["./scripts/fetch-models.sh", name])
+                run(["./scripts/fetch-models.sh", profile.name])
             pause()
         elif choice == "f":
             run(["./scripts/fetch-models.sh", config.profile])
@@ -513,6 +534,41 @@ def screen_models(state: dict[str, object]) -> None:
         elif choice == "c":
             run([venv_bin("voltage"), "compare"])
             pause()
+
+
+def _accept_profile(profile, budget: int | None) -> bool:
+    """Show a profile's warning and VRAM reality before switching to it."""
+    from .llm.profiles import EXPERIMENTAL
+
+    if profile.notes:
+        print()
+        for line in _wrap(profile.notes, 72):
+            print(f"  {dim(line)}")
+
+    risky = False
+    if profile.warning:
+        risky = True
+        print()
+        print(f"  {yellow('WARNING')}")
+        for line in _wrap(profile.warning, 72):
+            print(f"  {yellow(line)}")
+
+    if budget is not None and not profile.fits(budget):
+        risky = True
+        print()
+        print(f"  {red('WILL NOT FIT')}  needs ~{profile.vram_mb} MB, you have ~{budget} MB free.")
+        print(f"  {red('Layers will spill to system RAM and everything gets ~10x slower.')}")
+
+    if profile.name in EXPERIMENTAL or risky:
+        print()
+        return confirm(f"use {profile.name} anyway?", default=False)
+    return True
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(" ".join(text.split()), width) or [""]
 
 
 _EDITABLE: list[tuple[str, str, str]] = [

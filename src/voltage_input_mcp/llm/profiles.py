@@ -30,7 +30,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-__all__ = ["ModelSpec", "Profile", "PROFILES", "DEFAULT_PROFILE", "recommend", "get_profile"]
+__all__ = [
+    "ModelSpec", "Profile", "PROFILES", "EXPERIMENTAL", "DEFAULT_PROFILE",
+    "recommend", "get_profile",
+]
 
 Role = Literal["vision", "actuator", "draft"]
 
@@ -177,6 +180,7 @@ class Profile:
     actuator: ModelSpec
     min_vram_mb: int
     notes: str = ""
+    warning: str = ""
     actuator_on_cpu: bool = False
     expected_cycle_ms: tuple[int, int] = (0, 0)
     draft: ModelSpec | None = None
@@ -205,6 +209,8 @@ class Profile:
             "min_vram_mb": self.min_vram_mb,
             "expected_cycle_ms": list(self.expected_cycle_ms),
             "notes": self.notes,
+            "warning": self.warning,
+            "experimental": self.name in EXPERIMENTAL,
         }
 
 
@@ -402,8 +408,14 @@ def recommend(
     from .custom import all_profiles
 
     budget = usable_vram_mb(vram_mb, reserve_mb)
+    # Experimental profiles are never recommended: each trades something away that the
+    # user has to consent to knowingly. `hyper` would win on VRAM every time and quietly
+    # hand someone a vision model that cannot ground.
     ordered = sorted(
-        (p for p in all_profiles().values() if p.name != "ollama"),
+        (
+            p for p in all_profiles().values()
+            if p.name != "ollama" and p.name not in EXPERIMENTAL
+        ),
         key=lambda p: -p.vram_mb,
     )
     for profile in ordered:
@@ -432,3 +444,169 @@ def detect_vram_mb() -> int | None:
         return int(out.stdout.decode().strip().splitlines()[0])
     except (ValueError, IndexError):
         return None
+
+
+# ==========================================================================================
+# Experimental profiles
+# ==========================================================================================
+#
+# These trade one thing hard against another and are not defaults for good reasons. Each
+# carries a `warning` that says what actually breaks, grounded in the measurements in
+# `voltage bench` rather than in vibes.
+#
+# The measured facts that make these predictable:
+#   * decode dominates, at roughly 22 ms/token on a 6 GB Ampere card
+#   * decode speed scales with active parameters, so a 0.6B is ~3x faster than a 1.7B
+#   * one reported vision element is ~21 tokens, so ~500 ms
+#   * prefill is ~28 ms and flat -- image size is nearly free
+#
+# So the small end genuinely does raise the loop rate. What it costs is grounding, and
+# grounding failure is not graceful: the click lands somewhere else.
+
+SMOLVLM_500M = ModelSpec(
+    role="vision",
+    label="SmolVLM-Instruct (~500M)",
+    hf_repo="ggml-org/SmolVLM-Instruct-GGUF",
+    hf_file="SmolVLM-Instruct-Q4_K_M.gguf",
+    mmproj_repo="ggml-org/SmolVLM-Instruct-GGUF",
+    mmproj_file="mmproj-SmolVLM-Instruct-Q8_0.gguf",
+    params_b=0.5, weights_mb=420, n_ctx=2048, port=8080,
+    batch_size=1024, ubatch_size=768, threads=4,
+)
+
+QWEN3_0_6B = ModelSpec(
+    role="actuator",
+    label="Qwen3-0.6B",
+    hf_repo="unsloth/Qwen3-0.6B-GGUF",
+    hf_file="Qwen3-0.6B-Q4_K_M.gguf",
+    ollama_tag="qwen3:0.6b",
+    params_b=0.6, weights_mb=400, n_ctx=2048, port=8081,
+    batch_size=512, ubatch_size=256, threads=8,
+)
+
+QWEN_VL_32B = ModelSpec(
+    role="vision",
+    label="Qwen2.5-VL-32B-Instruct",
+    hf_repo="ggml-org/Qwen2.5-VL-32B-Instruct-GGUF",
+    hf_file="Qwen2.5-VL-32B-Instruct-Q4_K_M.gguf",
+    mmproj_repo="ggml-org/Qwen2.5-VL-32B-Instruct-GGUF",
+    mmproj_file="mmproj-Qwen2.5-VL-32B-Instruct-Q8_0.gguf",
+    params_b=32.0, weights_mb=19500, n_ctx=4096, port=8080,
+    batch_size=2048, ubatch_size=1024, threads=6,
+)
+
+QWEN3_14B = ModelSpec(
+    role="actuator",
+    label="Qwen3-14B",
+    hf_repo="unsloth/Qwen3-14B-GGUF",
+    hf_file="Qwen3-14B-Q4_K_M.gguf",
+    ollama_tag="qwen3:14b",
+    params_b=14.0, weights_mb=9000, n_ctx=4096, port=8081,
+    batch_size=512, ubatch_size=256, threads=8,
+)
+
+QWEN3_30B_A3B = ModelSpec(
+    role="actuator",
+    label="Qwen3-30B-A3B (MoE)",
+    hf_repo="unsloth/Qwen3-30B-A3B-GGUF",
+    hf_file="Qwen3-30B-A3B-Q4_K_M.gguf",
+    ollama_tag="qwen3:30b-a3b",
+    params_b=3.0,  # ACTIVE params -- decode speed tracks this, not the 30B total
+    weights_mb=18500,
+    n_ctx=4096, port=8081, batch_size=512, ubatch_size=256, threads=8,
+)
+
+
+EXPERIMENTAL: dict[str, Profile] = {
+    "hyper": Profile(
+        name="hyper",
+        description="SmolVLM-500M + Qwen3-0.6B. Maximum loop rate, worst grounding.",
+        vision=SMOLVLM_500M,
+        actuator=QWEN3_0_6B,
+        min_vram_mb=2200,
+        expected_cycle_ms=(60, 200),
+        notes=(
+            "Roughly 3-4x the loop rate of `lean`: ~0.9 GB of weights and decode at a "
+            "fraction of the cost. Suited to reflex-heavy playbooks where probes do the "
+            "real work and the models mostly pick between a few pre-planned bursts."
+        ),
+        warning=(
+            "SmolVLM-500M is NOT a grounding model. It will return boxes, and they will "
+            "often be wrong -- and a wrong box is a click in the wrong place, not a "
+            "graceful degradation. Only use this where `watch` is empty or where every "
+            "click is fenced by click_allow_regions and require_target_element. Run "
+            "`voltage compare` against a fixture before trusting it with dry_run off."
+        ),
+    ),
+    "fast": Profile(
+        name="fast",
+        description="Qwen2.5-VL-3B + Qwen3-0.6B. Keeps real grounding, faster decisions.",
+        vision=QWEN_VL_3B,
+        actuator=QWEN3_0_6B,
+        min_vram_mb=4000,
+        expected_cycle_ms=(120, 500),
+        notes=(
+            "The honest speed profile. Vision is unchanged from `lean`, so grounding is "
+            "unchanged; only the actuator shrinks. Under a GBNF grammar the actuator is "
+            "choosing among a handful of legal continuations, which a 0.6B can often do."
+        ),
+        warning=(
+            "A 0.6B follows a `brief` less reliably. It stays *legal* -- the grammar "
+            "guarantees that -- but is likelier to pick a legal-but-wrong action, so "
+            "expect more wasted cycles on multi-step states. Keep briefs to one "
+            "instruction and prefer more states over more complex ones."
+        ),
+    ),
+    "beefy": Profile(
+        name="beefy",
+        description="Qwen2.5-VL-32B + Qwen3-14B. Best grounding. Needs ~32 GB.",
+        vision=QWEN_VL_32B,
+        actuator=QWEN3_14B,
+        min_vram_mb=31000,
+        expected_cycle_ms=(900, 2500),
+        notes=(
+            "For dense, unusual or low-contrast UI where the 3B mislocates elements. "
+            "Worth it when grounding is the failure mode and latency is not."
+        ),
+        warning=(
+            "Slow, and slowness compounds here: decode scales with parameters, and a "
+            "reported element already costs ~21 tokens. Expect 1-2.5 s per perceived "
+            "cycle. Set perception.mode to 'on_change' and max_elements to 2-3, or the "
+            "loop will crawl. Unusable for games."
+        ),
+    ),
+    "beefy_moe": Profile(
+        name="beefy_moe",
+        description="Qwen2.5-VL-32B + Qwen3-30B-A3B. Big capacity at 3B decode speed.",
+        vision=QWEN_VL_32B,
+        actuator=QWEN3_30B_A3B,
+        min_vram_mb=40000,
+        expected_cycle_ms=(700, 2000),
+        notes=(
+            "The interesting one for this workload. Qwen3-30B-A3B is a mixture of "
+            "experts with ~3B active parameters, so it decodes at roughly 3B speed while "
+            "reasoning with 30B capacity -- and decode is exactly what bottlenecks this "
+            "loop. A much better actuator than a dense 14B at similar or better latency."
+        ),
+        warning=(
+            "The 30B total still has to be resident: ~18.5 GB for the actuator alone, "
+            "~40 GB with the 32B vision model. Only the active experts are fast, not the "
+            "memory. Needs a 48 GB card or two GPUs."
+        ),
+    ),
+    "cpu_only": Profile(
+        name="cpu_only",
+        description="Qwen2.5-VL-3B + Qwen3-0.6B, both on CPU. No GPU required.",
+        vision=QWEN_VL_3B,
+        actuator=QWEN3_0_6B,
+        actuator_on_cpu=True,
+        min_vram_mb=0,
+        expected_cycle_ms=(2000, 8000),
+        notes="Proves the pipeline works without a GPU. Useful for authoring and "
+              "dry-run testing playbooks on a laptop.",
+        warning=(
+            "Several seconds per cycle. Fine for validating a playbook's logic in "
+            "dry_run, useless for driving anything in real time."
+        ),
+    ),
+}

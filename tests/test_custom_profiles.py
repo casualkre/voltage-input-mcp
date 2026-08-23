@@ -6,7 +6,7 @@ import pytest
 
 from voltage_input_mcp.errors import ConfigError
 from voltage_input_mcp.llm.custom import delete_custom, load_custom, save_custom
-from voltage_input_mcp.llm.profiles import PROFILES, ModelSpec, Profile
+from voltage_input_mcp.llm.profiles import EXPERIMENTAL, PROFILES, ModelSpec, Profile
 
 
 def make(name: str = "mine", **kw) -> Profile:
@@ -85,8 +85,9 @@ def test_custom_shadows_builtin(tmp_path, monkeypatch):
 
     merged = all_profiles()
     assert merged["lean"].description == "my retune"
-    # Every built-in is still present.
+    # Every built-in and experimental profile is still present.
     assert set(PROFILES) <= set(merged)
+    assert set(EXPERIMENTAL) <= set(merged)
 
 
 def test_broken_file_does_not_break_all_profiles(tmp_path, monkeypatch):
@@ -96,4 +97,22 @@ def test_broken_file_does_not_break_all_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr("voltage_input_mcp.llm.custom.profiles_path", lambda: path)
     from voltage_input_mcp.llm.custom import all_profiles
 
-    assert set(all_profiles()) == set(PROFILES)
+    assert set(all_profiles()) == set(PROFILES) | set(EXPERIMENTAL)
+
+
+def test_recommend_never_returns_an_experimental_profile():
+    """`hyper` fits almost any GPU and would win on size every time.
+
+    Each experimental profile trades something away that the user has to consent to
+    knowingly -- `hyper` in particular hands over a vision model that cannot ground.
+    """
+    from voltage_input_mcp.llm.profiles import recommend
+
+    for vram in (2000, 4000, 6144, 12000, 24000, 80000):
+        assert recommend(vram).name not in EXPERIMENTAL
+
+
+def test_every_experimental_profile_carries_a_warning():
+    for name, profile in EXPERIMENTAL.items():
+        assert profile.warning, f"{name} is experimental but has no warning"
+        assert profile.notes, f"{name} has no notes explaining when to use it"
