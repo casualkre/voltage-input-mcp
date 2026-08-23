@@ -225,6 +225,53 @@ re-running.
 Fixtures are yours and not committed. Add `fixtures/` to `.gitignore` if your screenshots
 contain anything private.
 
+## The learning loop
+
+The first playbook for an unfamiliar target is almost never right. What matters is that
+the failures are *specific*, and that the next attempt starts from what the last one
+learned.
+
+```
+voltage_reference(section="loop")     the loop itself, and what each failure means
+voltage_reference(section="bursts")   the burst cookbook: chaining, timing, game patterns
+
+voltage_capture / voltage_observe     look before writing — check your labels exist
+voltage_validate_playbook             dead guards, unreachable states, caught statically
+voltage_run(dry_run=true)             real models, real screen, nothing injected
+voltage_diagnose(run_id)              ← what to change, not raw data
+voltage_learn(target=..., note=...)   record it; persists across sessions
+voltage_lessons(target=...)           recall it before the next playbook
+```
+
+**`voltage_diagnose` is the piece that makes this a loop.** It computes what the journal
+*implies* but does not state, and names the edit for each. On a stuck Minecraft run:
+
+```
+[BLOCKER] label_never_seen     never reported: ['crosshair', 'health bar']
+[BLOCKER] input_not_landing    14 bursts executed, but the screen never changed
+[BLOCKER] state_never_left     'mine' ran 14 cycles and never transitioned
+[PROBLEM] timid_bursts         bursts averaged 1.0 actions
+[HINT]    vision_every_cycle   vision ran on 100% of cycles
+```
+
+The distinction it exists for: **a burst that never ran and a burst that ran and did
+nothing look identical in a summary and have unrelated causes.** The first is policy or
+grammar. The second is window focus, pointer mode, or an app that ignores synthetic input.
+Diagnose separates them by checking whether the frame actually changed after execution.
+
+Apply the highest-severity finding, re-run, diagnose again. One change at a time — several
+at once makes the next diagnosis uninterpretable.
+
+**Lessons persist across sessions**, keyed by target, so the second playbook for a game
+starts from the probe coordinates and working label names the first one discovered:
+
+```
+voltage_learn(target="minecraft", kind="label",
+              note="vision reports 'hotbar' reliably but never 'crosshair'")
+voltage_learn(target="minecraft", kind="timing",
+              note="block placement needs w:100 after right click or it does not register")
+```
+
 ## Safety
 
 The thing generating inputs is a 1.7B model. The governor is the layer that is not

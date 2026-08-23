@@ -86,19 +86,38 @@ async def voltage_doctor() -> dict[str, Any]:
 
 @server.tool(annotations=READ_ONLY)
 async def voltage_reference(
-    section: Literal["all", "burst", "playbook", "guards", "example"] = "all",
+    section: Literal[
+        "all", "burst", "bursts", "playbook", "guards", "example", "loop"
+    ] = "all",
 ) -> dict[str, Any]:
-    """Return the Playbook and burst-DSL reference needed to author a run.
+    """Return everything needed to author and iterate on a run.
 
-    Read this before writing your first Playbook. `section` narrows the output:
-    "burst" for the input syntax, "playbook" for the state-machine schema, "guards" for
-    the expression functions available in transitions and reflexes, "example" for a
-    complete working Playbook.
+    Call this before your first Playbook. Sections:
+
+      loop      **the learning loop** -- how to go from a failed run to a working one,
+                and what each failure mode actually means. Read this second.
+      bursts    the burst cookbook: how to chain inputs well, timing rules, ready-made
+                patterns for desktop and for games, and the antipatterns that waste
+                cycles. Read this if bursts are coming out one action at a time.
+      burst     the raw burst syntax
+      playbook  the state-machine JSON schema
+      guards    expression functions for transitions and reflexes
+      example   a complete working Playbook
     """
     from .expr import GUARD_FUNCTIONS, GUARD_NAMESPACES
-    from .reference import BURST_REFERENCE, EXAMPLE_PLAYBOOK, GUARD_REFERENCE
+    from .reference import (
+        BURST_COOKBOOK,
+        BURST_REFERENCE,
+        EXAMPLE_PLAYBOOK,
+        GUARD_REFERENCE,
+        LEARNING_LOOP,
+    )
 
     out: dict[str, Any] = {"ok": True}
+    if section in ("all", "loop"):
+        out["learning_loop"] = LEARNING_LOOP
+    if section in ("all", "bursts"):
+        out["burst_cookbook"] = BURST_COOKBOOK
     if section in ("all", "burst"):
         out["burst"] = BURST_REFERENCE
         out["verbs"] = VERB_NAMES
@@ -513,6 +532,121 @@ async def voltage_journal(
             "stats": session.journal.stats(),
             "cycles": cycles,
         }
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+# ======================================================================================
+# Learning loop
+# ======================================================================================
+
+
+@server.tool(annotations=READ_ONLY)
+async def voltage_diagnose(run_id: str | None = None) -> dict[str, Any]:
+    """Explain why a run behaved as it did, and what to change.
+
+    Call this instead of reading the journal by hand. It computes what the journal
+    implies but does not state -- `watch` labels the vision model never once reported,
+    guards that never evaluated true, whether bursts actually moved the screen, whether
+    the actuator is chaining or emitting one action at a time -- and returns each with
+    the specific edit that fixes it, ordered blocker-first.
+
+    The distinction it exists for: a burst that **never ran** and a burst that **ran and
+    did nothing** look identical in a summary and have unrelated causes. The first is
+    policy or grammar; the second is window focus, pointer mode, or an application that
+    ignores synthetic input.
+
+    Apply the highest-severity finding, re-run, diagnose again. Changing several things
+    at once makes the next diagnosis uninterpretable.
+    """
+    try:
+        from .diagnose import diagnose
+
+        session = _app().get_session(run_id)
+        snapshot = session.snapshot(journal_tail=0)
+        report = diagnose(
+            list(session.journal.tail(limit=1000)),
+            session.playbook.spec.model_dump(),
+            status=session.status,
+            reason=session.reason,
+            dry_run=session.dry_run,
+        )
+        report["run_id"] = session.id
+        report["state"] = snapshot.get("state")
+        report["ok"] = True
+        return report
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@server.tool(annotations=READ_ONLY)
+async def voltage_lessons(target: str | None = None, limit: int = 30) -> dict[str, Any]:
+    """Recall what previous runs learned about driving something.
+
+    Call this **before writing a Playbook** for a target you have driven before. Lessons
+    persist across sessions and are keyed by target ("minecraft", "roblox", "dolphin"),
+    so a new Playbook can start from what the last one discovered -- which labels the
+    vision model actually recognises, where the HUD probes are, what timing the game
+    needs -- rather than rediscovering it.
+
+    Omit `target` to see everything recorded so far.
+    """
+    try:
+        from .diagnose import load_lessons
+
+        entries = load_lessons(target)[:limit]
+        return {
+            "ok": True,
+            "target": target,
+            "count": len(entries),
+            "lessons": entries,
+            "hint": (
+                "Record new ones with voltage_learn as you discover them -- especially "
+                "working `watch` labels, probe coordinates, and timing values, which are "
+                "expensive to rediscover."
+                if entries else
+                "Nothing recorded for this target yet. Use voltage_learn after a run."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return _error(exc)
+
+
+@server.tool(annotations=ACTS)
+async def voltage_learn(
+    target: str,
+    note: str,
+    kind: Literal["observation", "label", "timing", "policy", "burst"] = "observation",
+    playbook: str = "",
+) -> dict[str, Any]:
+    """Record something worth carrying to the next run against this target.
+
+    Write these as concrete, reusable facts, not narration:
+
+      good  "the health bar is at x=120..300, y=1010; region_mean on red channel works"
+      good  "vision reports 'hotbar' reliably but never 'crosshair' -- do not watch it"
+      good  "block placement needs w:100 after the right click or it does not register"
+      bad   "the run failed"
+      bad   "tried again and it worked better"
+
+    `kind` groups them: label (what the vision model does and does not recognise),
+    timing (waits that a specific application needs), policy (what the governor blocked
+    and whether that was right), burst (a sequence that works), observation (anything
+    else).
+    """
+    try:
+        from .diagnose import Lesson, save_lesson
+
+        note = note.strip()
+        if len(note) < 8:
+            return {
+                "ok": False,
+                "error": "note_too_short",
+                "detail": "A lesson should be a concrete, reusable fact -- see the "
+                          "examples in this tool's description.",
+            }
+        path = save_lesson(Lesson(target=target, note=note, kind=kind, playbook=playbook))
+        return {"ok": True, "target": target, "kind": kind, "stored": str(path)}
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
 
