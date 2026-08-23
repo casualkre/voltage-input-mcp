@@ -358,7 +358,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"voltage {__version__}")
     parser.add_argument("--config", type=Path, default=None, help="path to voltage.toml")
-    sub = parser.add_subparsers(dest="command", required=True)
+    # Not required: bare `voltage` opens the interactive console. Scripted use is
+    # unaffected, and a non-TTY invocation with no subcommand prints help rather than
+    # blocking on input forever.
+    sub = parser.add_subparsers(dest="command", required=False)
 
     p = sub.add_parser("doctor", help="check that everything needed for a run works")
     p.add_argument("--json", action="store_true")
@@ -420,9 +423,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cmd_console(args: argparse.Namespace) -> int:
+    from .tui import run_console
+
+    return run_console()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if getattr(args, "command", None) is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            return cmd_console(args)
+        parser.print_help()
+        return 0
+
     try:
         return int(args.func(args) or 0)
     except KeyboardInterrupt:

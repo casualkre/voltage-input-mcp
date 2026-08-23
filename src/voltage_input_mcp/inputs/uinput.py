@@ -36,6 +36,7 @@ absolute positioning for desktop UI and relative deltas for pointer-locked games
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import os
 import struct
@@ -401,4 +402,18 @@ def probe_uinput() -> dict[str, object]:
     except OSError as exc:
         result["ok"] = False
         result["reason"] = str(exc)
+        if exc.errno == errno.ENODEV:
+            # The node exists but no driver is behind it. udev's `static_node=uinput`
+            # creates the node unconditionally so that opening it can autoload the
+            # module; when autoload does not happen, open() fails with ENODEV rather
+            # than ENOENT. Checking only for the file's existence therefore reports a
+            # healthy device that cannot accept a single event.
+            result["reason"] = (
+                "the uinput device node exists but the kernel module is not loaded "
+                "(ENODEV). Input injection will fail until it is."
+            )
+            result["fix"] = (
+                "sudo modprobe uinput   "
+                "(persist with: echo uinput | sudo tee /etc/modules-load.d/uinput.conf)"
+            )
     return result

@@ -252,6 +252,45 @@ yourself.
 cd voltage-input-mcp && ./scripts/setup.sh
 ```
 
+Then just run:
+
+```bash
+voltage
+```
+
+With no arguments that opens an interactive console: live status, guided setup that fixes
+whatever is not ready in dependency order, a model switcher, a config editor, one-key
+registration with Claude Code, and diagnostics. Every subcommand below still works
+non-interactively, so scripts and CI are unaffected.
+
+```
+ ██╗   ██╗ ██████╗ ██╗  ████████╗ █████╗  ██████╗ ███████╗
+ ██║   ██║██╔═══██╗██║  ╚══██╔══╝██╔══██╗██╔════╝ ██╔════╝
+ ██║   ██║██║   ██║██║     ██║   ███████║██║  ███╗█████╗
+ ╚██╗ ██╔╝██║   ██║██║     ██║   ██╔══██║██║   ██║██╔══╝
+  ╚████╔╝ ╚██████╔╝███████╗██║   ██║  ██║╚██████╔╝███████╗
+   ╚═══╝   ╚═════╝ ╚══════╝╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+
+ ── status ──────────────────────────────────────────────
+   ok   input device      /dev/uinput
+   ok   vision model      http://127.0.0.1:8080
+   ok   actuator model    http://127.0.0.1:8081
+   ok   mcp registered    claude mcp list
+   ok   voltage on PATH   ~/.local/bin/voltage
+```
+
+### Shell commands vs MCP tools
+
+Two different surfaces, and mixing them up is the usual first stumble:
+
+| | invoked | looks like |
+|---|---|---|
+| **shell command** | typed in a terminal, with a **space** | `voltage doctor` |
+| **MCP tool** | asked of Claude, with an **underscore** | `voltage_doctor` |
+
+`voltage_doctor` is a tool name in Claude's namespace, not a program on disk. Typing it in
+a terminal will always say "unknown command". Ask Claude to run it instead.
+
 That checks `/dev/uinput` access, installs system dependencies, creates the venv, and
 prints what is missing. Then:
 
