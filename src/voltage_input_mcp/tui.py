@@ -799,6 +799,160 @@ def _new_custom_profile() -> None:
     pause()
 
 
+def screen_connect(state: dict[str, object]) -> None:
+    """What is set up, what the URLs are, and exactly how to wire this into a client."""
+    from .connect import CLIENTS, desktop_config_path, gather, instructions, stdio_json
+
+    while True:
+        clear()
+        banner()
+        info = gather()
+
+        rule("what is set up")
+        print(f"  {ok_mark(info.binary_exists)} server binary")
+        print(f"      {dim(info.binary)}")
+        if not info.binary_exists:
+            print(f"      {red('missing -- run setup, or pip install -e . in the repo')}")
+
+        print(f"  {ok_mark(info.http_running)} http endpoint  "
+              f"{dim('running' if info.http_running else 'not running')}")
+        print(f"      {cyan(info.http_url) if info.http_running else dim(info.http_url)}")
+        if not info.http_running:
+            print(f"      {dim('start with:')} {bold('voltage serve --http')}")
+
+        engine_ok = info.vision_up and info.actuator_up
+        print(f"  {ok_mark(engine_ok)} models         {dim(info.engine + ' / ' + info.profile)}")
+        if info.engine == "ollama":
+            print(f"      {dim('http://127.0.0.1:11434')}")
+        else:
+            print(f"      {dim('vision   ' + info.vision_url)}  "
+                  f"{green('up') if info.vision_up else red('down')}")
+            print(f"      {dim('actuator ' + info.actuator_url)}  "
+                  f"{green('up') if info.actuator_up else red('down')}")
+
+        print(f"  {ok_mark(info.registered if info.claude_cli else None)} claude code    ", end="")
+        if not info.claude_cli:
+            print(dim("cli not installed"))
+        elif info.registered:
+            print(dim(f"{info.registered_scope}  ({info.registered_status})"))
+            if info.registered_env_ok is False:
+                print(f"      {yellow('registered without the session environment --')}")
+                print(f"      {yellow('it will connect but cannot capture the screen.')}")
+                print(f"      {dim('re-register with [a] to fix.')}")
+        else:
+            print(dim("not registered"))
+
+        print(f"  {ok_mark(info.desktop_has_entry if info.desktop_config else None)} "
+              f"claude desktop ", end="")
+        if not info.desktop_config:
+            print(dim(f"config not found ({desktop_config_path().name})"))
+        else:
+            print(dim("configured" if info.desktop_has_entry else "config exists, no entry"))
+
+        if info.missing_env:
+            print()
+            print(f"  {yellow('note')} not set in this shell, so cannot be forwarded:")
+            print(f"       {yellow(', '.join(info.missing_env))}")
+            print(dim("       Screen capture needs these. Input injection does not, so a"))
+            print(dim("       server started without them appears to work and cannot see"))
+            print(dim("       the screen. Run this from inside your desktop session."))
+
+        print()
+        rule("set up as a custom MCP server")
+        for i, client in enumerate(CLIENTS, 1):
+            tag = cyan("[http]") if client.transport == "http" else dim("[stdio]")
+            print(f"  {bold(str(i))}  {client.name:<32} {tag}")
+        print()
+        print("  [1-7] step-by-step for that client   [j] print the JSON")
+        print("  [a] register with Claude Code now    [w] write Claude Desktop config")
+        print("  [q] back")
+
+        choice = ask("choice").lower()
+        if choice in ("q", ""):
+            return
+        if choice == "j":
+            clear()
+            banner()
+            rule("mcpServers entry")
+            print()
+            print(stdio_json(info))
+            print()
+            print(dim("  Paths and environment are filled in from this machine -- copy it"))
+            print(dim("  verbatim, do not substitute placeholders."))
+            pause()
+        elif choice == "a":
+            connect_mcp(state["config"])  # type: ignore[arg-type]
+            pause()
+        elif choice == "w":
+            _write_desktop_config(info)
+            pause()
+        elif choice.isdigit() and 1 <= int(choice) <= len(CLIENTS):
+            client = CLIENTS[int(choice) - 1]
+            clear()
+            banner()
+            rule(client.name)
+            print(f"  transport: {bold(client.transport)}    config: {dim(client.config_hint)}")
+            if client.note:
+                print()
+                for line in _wrap(client.note, 72):
+                    print(f"  {dim(line)}")
+            print()
+            for n, (text, block) in enumerate(instructions(client.key, info), 1):
+                for j, line in enumerate(_wrap(text, 70)):
+                    print(f"  {bold(str(n) + '.') if j == 0 else '  '} {line}")
+                if block:
+                    print()
+                    for line in block.splitlines():
+                        print(f"       {cyan(line)}")
+                print()
+            pause()
+
+
+def _write_desktop_config(info) -> None:
+    """Merge the entry into Claude Desktop's config, preserving anything already there."""
+    import json
+
+    from .connect import desktop_config_path
+
+    path = desktop_config_path()
+    print()
+    print(f"  target: {dim(str(path))}")
+
+    data: dict = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text())
+        except ValueError:
+            print(red("  the existing file is not valid JSON -- refusing to overwrite it."))
+            print(dim("  Fix or move it, then try again."))
+            return
+        backup = path.with_suffix(".json.bak")
+        try:
+            backup.write_text(path.read_text())
+            print(dim(f"  backed up to {backup}"))
+        except OSError as exc:
+            print(red(f"  could not write a backup ({exc}); not touching the file."))
+            return
+
+    servers = data.setdefault("mcpServers", {})
+    if "voltage-input" in servers and not confirm("entry exists -- replace it?", default=True):
+        return
+
+    entry: dict[str, object] = {"command": info.binary, "args": []}
+    if info.env:
+        entry["env"] = dict(info.env)
+    servers["voltage-input"] = entry
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as exc:
+        print(red(f"  could not write: {exc}"))
+        return
+    print(green("  written."))
+    print(f"  {bold('Fully quit Claude Desktop and reopen it')} -- reloading is not enough.")
+
+
 def screen_test(state: dict[str, object]) -> None:
     while True:
         clear()
@@ -908,7 +1062,7 @@ def run_console() -> int:
         print(f"  {bold('2')}  models       {dim('switch profile, fetch, serve, benchmark')}")
         print(f"  {bold('3')}  config       {dim('edit settings')}")
         print(f"  {bold('p')}  profiles     {dim('add your own models')}")
-        print(f"  {bold('4')}  connect      {dim('register with Claude Code')}")
+        print(f"  {bold('4')}  connect      {dim('urls, status, and per-client setup steps')}")
         print(f"  {bold('5')}  diagnostics  {dim('doctor, capture, calibrate')}")
         print(f"  {bold('6')}  help         {dim('shell commands vs MCP tools')}")
         print(f"  {bold('r')}  refresh      {bold('q')}  quit")
@@ -927,11 +1081,7 @@ def run_console() -> int:
         elif choice == "p":
             screen_custom_profiles(state)
         elif choice == "4":
-            clear()
-            banner()
-            rule("connect to Claude Code")
-            connect_mcp(state["config"])  # type: ignore[arg-type]
-            pause()
+            screen_connect(state)
         elif choice == "5":
             screen_test(state)
         elif choice == "6":

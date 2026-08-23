@@ -116,3 +116,39 @@ def test_every_experimental_profile_carries_a_warning():
     for name, profile in EXPERIMENTAL.items():
         assert profile.warning, f"{name} is experimental but has no warning"
         assert profile.notes, f"{name} has no notes explaining when to use it"
+
+
+# -- connection info -------------------------------------------------------------------
+
+
+def test_stdio_json_is_valid_and_carries_the_environment():
+    """A config emitted without the session environment connects but cannot see."""
+    import json as _json
+
+    from voltage_input_mcp.connect import ConnectionInfo, stdio_json
+
+    info = ConnectionInfo(binary="/x/voltage-input-mcp", env={"DISPLAY": ":0"})
+    data = _json.loads(stdio_json(info))
+    entry = data["mcpServers"]["voltage-input"]
+    assert entry["command"] == "/x/voltage-input-mcp"
+    assert entry["env"]["DISPLAY"] == ":0"
+
+
+def test_claude_code_command_quotes_paths_with_spaces():
+    """The repo path here contains spaces; an unquoted command silently truncates."""
+    from voltage_input_mcp.connect import ConnectionInfo, claude_code_command
+
+    info = ConnectionInfo(binary="/home/a b/voltage-input-mcp", env={"DISPLAY": ":0"})
+    cmd = claude_code_command(info)
+    assert '"/home/a b/voltage-input-mcp"' in cmd
+    assert "-e DISPLAY=:0" in cmd
+
+
+def test_every_client_produces_steps():
+    from voltage_input_mcp.connect import CLIENTS, ConnectionInfo, instructions
+
+    info = ConnectionInfo(binary="/x/bin", http_url="http://127.0.0.1:8765/mcp")
+    for client in CLIENTS:
+        steps = instructions(client.key, info)
+        assert steps, f"{client.key} produced no instructions"
+        assert all(isinstance(text, str) and text for text, _ in steps)

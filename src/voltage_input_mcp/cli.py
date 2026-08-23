@@ -341,6 +341,62 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if "error" not in report else 1
 
 
+def cmd_connect(args: argparse.Namespace) -> int:
+    """Print connection status and per-client setup instructions."""
+    from .connect import CLIENTS, claude_code_command, gather, instructions, stdio_json
+
+    info = gather(port=args.port)
+    if args.json:
+        print(stdio_json(info))
+        return 0
+
+    if args.client:
+        keys = {c.key for c in CLIENTS}
+        if args.client not in keys:
+            print(f"unknown client {args.client!r}; try: {', '.join(sorted(keys))}",
+                  file=sys.stderr)
+            return 2
+        name = next(c.name for c in CLIENTS if c.key == args.client)
+        print(f"{name}\n")
+        for i, (text, block) in enumerate(instructions(args.client, info), 1):
+            print(f"{i}. {text}")
+            if block:
+                print()
+                for line in block.splitlines():
+                    print(f"     {line}")
+            print()
+        return 0
+
+    print("server binary   " + info.binary + ("" if info.binary_exists else "   (MISSING)"))
+    print("http endpoint   " + info.http_url +
+          ("   running" if info.http_running else "   not running"))
+    if info.engine == "ollama":
+        print("models          ollama http://127.0.0.1:11434")
+    else:
+        print(f"vision model    {info.vision_url}   {'up' if info.vision_up else 'down'}")
+        print(f"actuator model  {info.actuator_url}   {'up' if info.actuator_up else 'down'}")
+    if not info.claude_cli:
+        print("claude code     cli not installed")
+    elif info.registered:
+        print(f"claude code     {info.registered_scope}  ({info.registered_status})")
+        if info.registered_env_ok is False:
+            print("                registered WITHOUT the session environment -- it will")
+            print("                connect but cannot capture the screen. Re-register.")
+    else:
+        print("claude code     not registered")
+    if info.missing_env:
+        print("missing env     " + ", ".join(info.missing_env) +
+              "   (screen capture needs these)")
+    print()
+    print("clients:  " + ", ".join(c.key for c in CLIENTS))
+    print("steps:    voltage connect --client claude-desktop")
+    print("json:     voltage connect --json")
+    print()
+    print("claude code, in one line:")
+    print("  " + claude_code_command(info))
+    return 0
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     from .server import main as serve_stdio
     from .server import main_http
@@ -420,6 +476,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser("connect", help="show URLs and per-client MCP setup instructions")
+    p.add_argument("--client", help="print steps for one client (see the list it prints)")
+    p.add_argument("--json", action="store_true", help="print the mcpServers entry only")
+    p.add_argument("--port", type=int, default=8765)
+    p.set_defaults(func=cmd_connect)
 
     p = sub.add_parser("serve", help="run the MCP server (stdio, or HTTP for connectors)")
     p.add_argument("--http", action="store_true", help="serve over HTTP for a custom connector")

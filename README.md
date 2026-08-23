@@ -376,6 +376,32 @@ prints what is missing. Then:
 .venv/bin/voltage doctor
 ```
 
+## Connecting it to a client
+
+```bash
+voltage connect
+```
+
+Shows what is set up, the live URLs, whether the models are up, and whether the server is
+registered — then gives copy-paste steps per client with **your real paths and environment
+already filled in**:
+
+```
+voltage connect --client claude-desktop
+voltage connect --client cursor
+voltage connect --json            # just the mcpServers entry
+```
+
+Covered: Claude Code, Claude Desktop, claude.ai custom connector, Cursor, Windsurf, Zed,
+and a generic `mcpServers` block for anything else. The same thing is screen **4** in the
+`voltage` console, which can also write the Claude Desktop config for you (backing up the
+existing file first, and refusing to touch it if it is not valid JSON).
+
+Every generated config carries the session environment explicitly, because that is the
+thing that goes wrong: a server registered from a shell without
+`DBUS_SESSION_BUS_ADDRESS` connects successfully and is **silently blind** — input works,
+screen capture does not. `voltage connect` detects that case and says so.
+
 ## Adding it as a custom connector
 
 Clients that add MCP servers by URL need HTTP rather than stdio:
