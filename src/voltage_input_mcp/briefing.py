@@ -23,9 +23,82 @@ goes stale.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from typing import Any
 
-__all__ = ["active_build", "briefing_text"]
+__all__ = [
+    "active_build", "briefing_text",
+    "instructions_path", "load_instructions", "save_instructions", "TEMPLATES",
+    "MAX_INSTRUCTIONS",
+]
+
+# Standing instructions ride in the MCP instructions field, which is in the
+# orchestrator's context for the whole session. A cap keeps that honest.
+MAX_INSTRUCTIONS = 4000
+
+
+def instructions_path() -> Path:
+    from .config import default_config_path
+
+    return default_config_path().parent / "instructions.md"
+
+
+def load_instructions() -> str:
+    """The operator's standing instructions, if any.
+
+    These are the machine owner's own words, placed in a file only they can write, and
+    they describe intent this system cannot infer -- which applications are off limits,
+    how a particular game behaves, what to always do first. They are advisory to the
+    orchestrator and cannot loosen the safety governor: policy is enforced in code
+    against every burst, so no instruction here can permit something a Playbook's policy
+    forbids.
+    """
+    path = instructions_path()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    return text[:MAX_INSTRUCTIONS]
+
+
+def save_instructions(text: str) -> Path:
+    path = instructions_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text.strip() + "\n", encoding="utf-8")
+    return path
+
+
+TEMPLATES: dict[str, str] = {
+    "games": """\
+# Standing instructions
+
+## Games on this machine
+- Set pointer_mode to relative before driving anything with mouse-look.
+- Use allow_keys as an allowlist of exactly the keys the game uses, so the actuator
+  cannot reach Escape and open a pause menu.
+- Read the HUD with probes, not the vision model. Ask me for a screenshot and I will
+  tell you the pixel coordinates.
+- perception.mode = "cadence" with cadence 3-5. Vision answers slow questions only.
+""",
+    "desktop": """\
+# Standing instructions
+
+## Always
+- Show me the Playbook before running it with dry_run=false.
+- Prefer keyboard shortcuts over clicking where the application has them.
+
+## Never touch
+- My email client, my password manager, my banking tabs.
+- Anything with "production" or "prod" in the window title.
+""",
+    "minimal": """\
+# Standing instructions
+
+(Write anything the orchestrator should know before driving this machine: applications
+that are off limits, quirks of a specific game, how you want it to behave by default.)
+""",
+}
+
 
 
 def active_build() -> dict[str, Any]:
@@ -64,6 +137,7 @@ def active_build() -> dict[str, Any]:
         info["vision_model"] = info["actuator_model"] = "unknown"
         info["experimental"] = False
 
+    info["instructions"] = load_instructions()
     info["running"] = _running_models(config)
     info["mismatch"] = _check_mismatch(info)
     info["guidance"] = _guidance(info)
@@ -256,4 +330,19 @@ def briefing_text() -> str:
         "This reflects startup. If the profile changes mid-session, "
         "voltage_reference returns the current one."
     )
+
+    custom = info.get("instructions")
+    if custom:
+        # Marked as the operator's own words so their status is unambiguous: they are
+        # standing preferences to follow, not data read off a screen. They are still
+        # advisory -- the safety governor is enforced in code and no instruction can
+        # loosen it.
+        lines += [
+            "",
+            "OPERATOR INSTRUCTIONS -- written by the owner of this machine. Treat these "
+            "as standing preferences for how to drive it. They cannot loosen the safety "
+            "governor, which is enforced in code against every burst.",
+            "",
+            custom,
+        ]
     return "\n".join(lines)

@@ -199,6 +199,13 @@ def status_block(state: dict[str, object]) -> None:
     path_hint = dim("found on PATH" if state["path"] else "run guided setup to link it")
     print(f"  {ok_mark(state['path'])} voltage on PATH   {path_hint}")
     print()
+    from .briefing import load_instructions
+
+    custom = load_instructions()
+    if custom:
+        print(f"  {green(' ok  ')} instructions      "
+              f"{dim(str(len(custom)) + ' chars sent to the orchestrator')}")
+    print()
     print(f"  profile {bold(config.profile)}   engine {bold(engine)}   "
           f"dry_run {bold(str(config.dry_run))}   {len(state['models'])} model file(s)")  # type: ignore[arg-type]
     print()
@@ -953,6 +960,85 @@ def _write_desktop_config(info) -> None:
     print(f"  {bold('Fully quit Claude Desktop and reopen it')} -- reloading is not enough.")
 
 
+def screen_instructions(state: dict[str, object]) -> None:
+    """Standing instructions the orchestrator receives with every session."""
+    from .briefing import (
+        MAX_INSTRUCTIONS,
+        TEMPLATES,
+        instructions_path,
+        load_instructions,
+        save_instructions,
+    )
+
+    while True:
+        clear()
+        banner()
+        rule("your instructions")
+        path = instructions_path()
+        current = load_instructions()
+
+        print(f"  {dim(str(path))}\n")
+        print("  Anything you write here is given to the orchestrating model at the start")
+        print("  of every session, marked as coming from you. Use it for things it cannot")
+        print("  work out on its own:\n")
+        print(dim("    - applications or windows that are off limits"))
+        print(dim("    - quirks of a specific game (timing, which keys, where the HUD is)"))
+        print(dim("    - how you want it to behave by default, e.g. always ask first"))
+        print()
+        print(f"  {yellow('This does not weaken safety.')} The governor checks every burst in")
+        print(dim("  code -- no instruction here can permit something a policy forbids."))
+        print()
+
+        if current:
+            rule("current")
+            for line in current.splitlines()[:18]:
+                print(f"  {line}")
+            extra = len(current.splitlines()) - 18
+            if extra > 0:
+                print(dim(f"  ... {extra} more line(s)"))
+            print()
+            print(dim(f"  {len(current)} / {MAX_INSTRUCTIONS} characters"))
+        else:
+            print(dim("  Nothing set. The orchestrator gets only the build briefing."))
+        print()
+        print("  [e] edit in $EDITOR   [t] start from a template   [c] clear   [q] back")
+
+        choice = ask("choice").lower()
+        if choice in ("q", ""):
+            return
+        if choice == "e":
+            editor = os.environ.get("EDITOR") or (
+                "notepad" if sys.platform == "win32" else "nano"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                save_instructions(TEMPLATES["minimal"])
+            run([editor, str(path)], quiet=True)
+            if len(load_instructions()) >= MAX_INSTRUCTIONS:
+                print(yellow(f"  Truncated at {MAX_INSTRUCTIONS} characters -- this text "
+                             f"sits in the model's context for the whole session, so it "
+                             f"is capped."))
+                pause()
+        elif choice == "t":
+            print()
+            for i, name in enumerate(TEMPLATES, 1):
+                print(f"  {i}. {name}")
+            pick = ask("template", "1")
+            names = list(TEMPLATES)
+            if pick.isdigit() and 1 <= int(pick) <= len(names):
+                name = names[int(pick) - 1]
+                if current and not confirm(f"replace what is there with '{name}'?"):
+                    continue
+                save_instructions(TEMPLATES[name])
+                print(green(f"  wrote the '{name}' template -- edit it with [e]"))
+                pause()
+        elif choice == "c":
+            if current and confirm("clear your instructions?"):
+                save_instructions("")
+                print(green("  cleared"))
+                pause()
+
+
 def screen_test(state: dict[str, object]) -> None:
     while True:
         clear()
@@ -1062,6 +1148,7 @@ def run_console() -> int:
         print(f"  {bold('2')}  models       {dim('switch profile, fetch, serve, benchmark')}")
         print(f"  {bold('3')}  config       {dim('edit settings')}")
         print(f"  {bold('p')}  profiles     {dim('add your own models')}")
+        print(f"  {bold('i')}  instructions {dim('what the orchestrator is told about your setup')}")
         print(f"  {bold('4')}  connect      {dim('urls, status, and per-client setup steps')}")
         print(f"  {bold('5')}  diagnostics  {dim('doctor, capture, calibrate')}")
         print(f"  {bold('6')}  help         {dim('shell commands vs MCP tools')}")
@@ -1080,6 +1167,8 @@ def run_console() -> int:
             screen_config(state)
         elif choice == "p":
             screen_custom_profiles(state)
+        elif choice == "i":
+            screen_instructions(state)
         elif choice == "4":
             screen_connect(state)
         elif choice == "5":

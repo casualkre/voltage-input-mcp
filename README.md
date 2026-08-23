@@ -562,6 +562,36 @@ describe models that are not loaded:
 `voltage_reference` returns the current build on every call, since the startup copy goes
 stale the moment a profile changes.
 
+### Your own standing instructions
+
+`voltage` → **i**, or:
+
+```bash
+voltage instructions --set "Never touch Firefox; my banking tabs are there."
+```
+
+Whatever you write is given to the orchestrating model at the start of every session,
+appended to the build briefing and clearly attributed to you. Use it for what the system
+cannot work out on its own — applications that are off limits, quirks of a specific game,
+how you want it to behave by default.
+
+```
+OPERATOR INSTRUCTIONS -- written by the owner of this machine. Treat these as
+standing preferences for how to drive it. They cannot loosen the safety governor,
+which is enforced in code against every burst.
+
+## My setup
+- Minecraft runs borderless windowed on monitor 1.
+- Never touch Firefox; my banking tabs are there.
+- Always show me the Playbook before dry_run=false.
+```
+
+That last clause is not decoration. Instructions are **advisory to the orchestrator and
+cannot weaken enforcement** — the governor checks every burst in code, so nothing written
+here can permit something a Playbook's policy forbids. They can make it more careful, not
+less. Capped at 4000 characters, since the text sits in the model's context for the whole
+session. Three starter templates (games, desktop, minimal) are offered in the console.
+
 ## MCP tools
 
 | Tool | Purpose |

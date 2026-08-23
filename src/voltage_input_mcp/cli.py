@@ -343,6 +343,32 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if "error" not in report else 1
 
 
+def cmd_instructions(args: argparse.Namespace) -> int:
+    """Show, set, or clear the standing instructions sent to the orchestrator."""
+    from .briefing import instructions_path, load_instructions, save_instructions
+
+    path = instructions_path()
+    if args.clear:
+        save_instructions("")
+        print(f"cleared {path}")
+        return 0
+    if args.set is not None:
+        save_instructions(args.set)
+        print(f"wrote {path}")
+        return 0
+
+    current = load_instructions()
+    print(f"# {path}")
+    if current:
+        print()
+        print(current)
+    else:
+        print("\n(nothing set -- the orchestrator gets only the build briefing)")
+        print("\nSet with:  voltage instructions --set \"...\"")
+        print("Or edit interactively:  voltage  ->  i")
+    return 0
+
+
 def cmd_connect(args: argparse.Namespace) -> int:
     """Print connection status and per-client setup instructions."""
     from .connect import CLIENTS, claude_code_command, gather, instructions, stdio_json
@@ -478,6 +504,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--rounds", type=int, default=5)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bench)
+
+    p = sub.add_parser(
+        "instructions", help="standing instructions given to the orchestrator"
+    )
+    p.add_argument("--set", help="replace them with this text")
+    p.add_argument("--clear", action="store_true")
+    p.set_defaults(func=cmd_instructions)
 
     p = sub.add_parser("connect", help="show URLs and per-client MCP setup instructions")
     p.add_argument("--client", help="print steps for one client (see the list it prints)")
