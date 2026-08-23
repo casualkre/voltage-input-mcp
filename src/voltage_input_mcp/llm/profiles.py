@@ -480,8 +480,21 @@ QWEN3_0_6B = ModelSpec(
     hf_repo="unsloth/Qwen3-0.6B-GGUF",
     hf_file="Qwen3-0.6B-Q4_K_M.gguf",
     ollama_tag="qwen3:0.6b",
-    params_b=0.6, weights_mb=400, n_ctx=2048, port=8081,
-    batch_size=512, ubatch_size=256, threads=8,
+    params_b=0.6,
+    weights_mb=400,
+    # 1536 is measured against the real prompt: system block plus a per-cycle tail runs
+    # ~500 tokens, and the reply is capped at 96. Every unused context token is KV cache
+    # that buys nothing, and on the profile whose entire purpose is latency that is worth
+    # reclaiming.
+    n_ctx=1536,
+    port=8081,
+    batch_size=512,
+    # The prompt fits one pass, so a larger micro-batch only grows the compute buffer.
+    ubatch_size=512,
+    # Deliberately high for a 0.6B. Decode is so fast here that CPU-side GBNF evaluation
+    # -- which runs once per sampled token -- becomes a real share of the cycle. This is
+    # the one knob where the small profile wants *more* than the large one.
+    threads=10,
 )
 
 QWEN_VL_32B = ModelSpec(
@@ -544,11 +557,17 @@ EXPERIMENTAL: dict[str, Profile] = {
         vision=QWEN_VL_3B,
         actuator=QWEN3_0_6B,
         min_vram_mb=4000,
-        expected_cycle_ms=(120, 500),
+        expected_cycle_ms=(90, 420),
         notes=(
-            "The honest speed profile. Vision is unchanged from `lean`, so grounding is "
-            "unchanged; only the actuator shrinks. Under a GBNF grammar the actuator is "
-            "choosing among a handful of legal continuations, which a 0.6B can often do."
+            "The honest speed profile, and the one to try first if `lean` feels slow. "
+            "Vision is unchanged from `lean`, so grounding is identical -- only the "
+            "actuator shrinks, and under a GBNF grammar it is choosing among a handful "
+            "of legal continuations rather than reasoning freely, which a 0.6B can often "
+            "do. Tuned for it: 1536 context (the prompt is ~500 tokens), a single-pass "
+            "micro-batch, and 10 CPU threads, because at this decode speed grammar "
+            "evaluation on the CPU is a real share of the cycle. Pair it with "
+            "perception.mode='on_change' and max_elements 3 and most cycles cost only "
+            "the actuator."
         ),
         warning=(
             "A 0.6B follows a `brief` less reliably. It stays *legal* -- the grammar "

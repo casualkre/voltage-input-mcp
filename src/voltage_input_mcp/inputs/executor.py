@@ -25,6 +25,16 @@ on. `DeviceSet` implements it over uinput on Linux; `Win32Sink` implements it ov
 SendInput on Windows. Everything above -- burst scheduling, timing, held-key tracking,
 abort handling -- is shared.
 
+Drags and held modifiers
+------------------------
+Held state composes: `d:shift;g:0;p:l;g:1;e:l;u:shift` holds Shift across a button press,
+a move and a release, which is what shift-drag means everywhere. Modifiers are released
+in reverse order so they outlive the thing they modify.
+
+Motion while a button is held is interpolated -- see `_move_to`. This is not cosmetic:
+applications infer "a drag is happening" from the motion itself, so a teleport reads as
+two unrelated clicks.
+
 Text
 ----
 uinput sends scancodes, so typing via keystrokes produces whatever the compositor's
@@ -79,6 +89,13 @@ __all__ = ["Executor", "ExecutionReport", "TextMode", "PointerMode"]
 _SPIN_THRESHOLD_S: Final = 0.0015
 # Longest single blocking wait, so abort latency stays bounded even inside a long w:.
 _WAIT_SLICE_S: Final = 0.02
+
+# Drag interpolation. A pointer that teleports while a button is held is not a drag as
+# far as most applications are concerned -- they watch for motion to cross a threshold
+# and to size a selection. These only apply when something is actually held.
+_DRAG_MIN_STEPS: Final = 6
+_DRAG_MAX_STEPS: Final = 24
+_DRAG_STEP_MS: Final = 8
 
 
 class TextMode(enum.StrEnum):
@@ -309,13 +326,16 @@ class Executor:
         if isinstance(action, TypeText):
             return self._do_text(action, cursor)
         if isinstance(action, MoveAbs):
-            self._wait_until(cursor)
-            self._do_move_abs(action.x, action.y)
-            return cursor
+            return self._move_to(action.x, action.y, cursor)
         if isinstance(action, MoveRel):
-            self._wait_until(cursor)
-            self._do_move_rel(action.dx, action.dy)
-            return cursor
+            cx, cy = self._cursor
+            w, h = self.devices.screen
+            return self._move_to(
+                max(0, min(cx + action.dx, w - 1)),
+                max(0, min(cy + action.dy, h - 1)),
+                cursor,
+                relative=True,
+            )
         if isinstance(action, Click):
             return self._do_click(action, cursor)
         if isinstance(action, ButtonDown):
@@ -415,6 +435,63 @@ class Executor:
                 t += gap
         return t
 
+    def _move_to(
+        self, x: int, y: int, cursor: float, *, relative: bool = False
+    ) -> float:
+        """Move to (x, y), interpolating when a button is held.
+
+        A drag is not "button down, jump, button up". Applications decide a drag has
+        started by watching motion: a file manager needs to cross a drag threshold before
+        it begins drag-and-drop, a canvas needs the intermediate points to draw through,
+        and a selection rectangle needs them to size itself. Teleporting the pointer with
+        a button held produces a click at the origin and a click at the destination --
+        which is why this looked correct in a trace and failed against real software.
+
+        So when anything is held, the move is broken into steps spaced a few milliseconds
+        apart. When nothing is held there is no reason to pay for that, and the pointer
+        jumps as before.
+        """
+        held = bool(self._held_buttons)
+        start = self._cursor
+
+        if not held:
+            self._wait_until(cursor)
+            self._emit_move(x, y, relative=relative, previous=start)
+            return cursor
+
+        distance = max(abs(x - start[0]), abs(y - start[1]))
+        if distance <= 1:
+            self._wait_until(cursor)
+            self._emit_move(x, y, relative=relative, previous=start)
+            return cursor
+
+        # One step per ~40 px, bounded. Enough for an application to see continuous
+        # motion without turning a long drag into hundreds of events.
+        steps = max(_DRAG_MIN_STEPS, min(_DRAG_MAX_STEPS, distance // 40))
+        gap = _DRAG_STEP_MS / 1000.0
+        previous = start
+        for i in range(1, steps + 1):
+            self._wait_until(cursor + (i - 1) * gap)
+            if self._abort.is_set():
+                break
+            # Ease slightly: real drags are not perfectly linear, and a first small step
+            # is what crosses an application's drag threshold cleanly.
+            fraction = i / steps
+            nx = int(round(start[0] + (x - start[0]) * fraction))
+            ny = int(round(start[1] + (y - start[1]) * fraction))
+            self._emit_move(nx, ny, relative=relative, previous=previous)
+            previous = (nx, ny)
+        return cursor + steps * gap
+
+    def _emit_move(
+        self, x: int, y: int, *, relative: bool, previous: tuple[int, int]
+    ) -> None:
+        if relative:
+            self._do_move_rel(x - previous[0], y - previous[1])
+            self._cursor = (x, y)
+        else:
+            self._do_move_abs(x, y)
+
     def _do_move_abs(self, x: int, y: int) -> None:
         self._cursor = (x, y)
         if self.dry_run:
@@ -434,7 +511,7 @@ class Executor:
         cx, cy = self._cursor
         w, h = self.devices.screen
         self._cursor = (max(0, min(cx + dx, w - 1)), max(0, min(cy + dy, h - 1)))
-        if self.dry_run:
+        if self.dry_run or (dx == 0 and dy == 0):
             return
         self.devices.move_rel(dx, dy)
 
