@@ -33,8 +33,9 @@ voltage-input-mcp = "voltage_input_mcp.server:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/voltage_input_mcp"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/voltage_input_mcp/grammars" = "voltage_input_mcp/grammars"
+# No package data to force-include: grammars are generated per cycle in llm/grammar.py
+# rather than shipped as static .gbnf files, because the useful constraints (the element
+# count, the legal transitions, the key allowlist) are only known at runtime.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
