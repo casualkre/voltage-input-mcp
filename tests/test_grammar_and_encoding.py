@@ -102,12 +102,23 @@ def test_no_dangling_rule_references():
 
 
 def test_observation_labels_are_a_closed_vocabulary():
-    g = observation_grammar(["address bar", "file list"], max_elements=3)
-    label = [ln for ln in g.splitlines() if ln.startswith("label ::=")][0]
-    assert '"address bar"' in label and '"file list"' in label
-    # Generic fallbacks are included so the model can report a dialog it was not told
-    # to look for, but nothing outside the union is representable.
-    assert '"dialog"' in label
+    """Labels are reported as an index, so the vocabulary is closed by construction.
+
+    The model picks a position in the list; it cannot spell a label at all, let alone
+    spell one that is not there.
+    """
+    from voltage_input_mcp.llm.grammar import vision_vocabulary
+
+    watch = ["address bar", "file list"]
+    vocabulary = vision_vocabulary(watch)
+    assert vocabulary[:2] == watch
+    # Generic fallbacks follow, so the model can report a dialog it was not told to
+    # look for, but nothing outside the union is representable.
+    assert "dialog" in vocabulary
+
+    g = observation_grammar(watch, max_elements=3)
+    line = [ln for ln in g.splitlines() if ln.startswith("labelidx ::=")][0]
+    assert line.startswith('labelidx ::= "0" | "1"')
 
 
 def test_observation_coordinates_are_locked_to_0_1000():
@@ -201,3 +212,72 @@ def test_is_typeable_gates_the_clipboard_fallback():
     assert km.is_typeable("Hello, world! (test) #1")
     assert not km.is_typeable("Ağustos")
     assert not km.is_typeable("naïve")
+
+
+# -- compact element encoding ----------------------------------------------------------
+
+
+def test_elements_use_the_compact_array_form():
+    """Decode is the vision bottleneck, so elements are [idx, x1, y1, x2, y2]."""
+    g = observation_grammar(["address bar"], max_elements=3)
+    assert 'element ::= "[" labelidx "," coord "," coord "," coord "," coord "]"' in g
+    # The verbose object form must be gone -- it costs ~9 more tokens per element.
+    assert '\\"l\\":' not in g
+
+
+def test_label_index_range_covers_the_whole_vocabulary():
+    from voltage_input_mcp.llm.grammar import vision_vocabulary
+
+    watch = ["address bar", "file list"]
+    vocabulary = vision_vocabulary(watch)
+    g = observation_grammar(watch)
+    line = [ln for ln in g.splitlines() if ln.startswith("labelidx ::=")][0]
+    assert line.count('"') == 2 * len(vocabulary)
+    assert f'"{len(vocabulary) - 1}"' in line
+    assert f'"{len(vocabulary)}"' not in line
+
+
+def test_parser_and_grammar_agree_on_label_ordering():
+    """The one way this encoding can fail silently: index drift between the two sides.
+
+    If the grammar and the parser build the vocabulary differently, every element comes
+    back with the wrong label and the run misbehaves in a way that looks like the vision
+    model hallucinating.
+    """
+    from voltage_input_mcp.llm.grammar import vision_vocabulary
+    from voltage_input_mcp.models.observation import CoordinateMapper, parse_vision_output
+
+    watch = ["address bar", "file list", "save button"]
+    vocabulary = vision_vocabulary(watch)
+    mapper = CoordinateMapper(capture_size=(1000, 1000), screen_size=(1000, 1000))
+
+    for index, expected in enumerate(vocabulary[:4]):
+        raw = f'{{"s":"x","e":[[{index},100,100,200,200]]}}'
+        obs = parse_vision_output(raw, mapper, vocabulary=vocabulary)
+        assert obs.elements[0].label == expected
+
+
+def test_parser_still_accepts_the_verbose_form_for_ollama():
+    from voltage_input_mcp.models.observation import CoordinateMapper, parse_vision_output
+
+    mapper = CoordinateMapper(capture_size=(1000, 1000), screen_size=(1000, 1000))
+    raw = '{"s":"x","e":[{"l":"address bar","b":[100,100,200,200],"c":0.8}]}'
+    obs = parse_vision_output(raw, mapper)
+    assert obs.elements[0].label == "address bar"
+    assert obs.elements[0].conf == 0.8
+
+
+def test_out_of_range_label_index_is_dropped_not_guessed():
+    from voltage_input_mcp.models.observation import CoordinateMapper, parse_vision_output
+
+    mapper = CoordinateMapper(capture_size=(1000, 1000), screen_size=(1000, 1000))
+    obs = parse_vision_output(
+        '{"s":"x","e":[[99,100,100,200,200]]}', mapper, vocabulary=["only one"]
+    )
+    assert obs.elements == []
+
+
+def test_actuator_note_is_short_by_default():
+    """The note is diagnostic only and cost 55% of actuator latency at 48 chars."""
+    g = actuator_grammar(allow_verbs=["c"], targets=[], n_elements=1)
+    assert "{0,12}" in [ln for ln in g.splitlines() if ln.startswith("note ::=")][0]

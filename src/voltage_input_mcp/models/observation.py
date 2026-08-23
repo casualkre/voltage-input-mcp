@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -237,27 +238,58 @@ class CoordinateMapper:
         h = max(0, min(h, screen_h - y))
         return x, y, w, h
 
-    def map_all(self, raw_elements: list[dict[str, Any]]) -> list[Element]:
-        boxes = [e["b"] for e in raw_elements if isinstance(e.get("b"), list) and len(e["b"]) >= 4]
-        space = self._resolve(boxes)
-        out: list[Element] = []
+    def map_all(
+        self,
+        raw_elements: list[Any],
+        vocabulary: Sequence[str] | None = None,
+    ) -> list[Element]:
+        """Map raw vision output to screen-space elements.
+
+        Accepts two encodings:
+
+          compact  ``[label_index, x1, y1, x2, y2]`` -- what the grammar emits. The index
+                   refers to `vocabulary`, which the caller must build with
+                   `llm.grammar.vision_vocabulary` so the ordering matches the grammar's.
+          verbose  ``{"l": "address bar", "b": [x1, y1, x2, y2], "c": 0.9}`` -- what a
+                   backend without grammar support (Ollama) produces from a JSON schema.
+
+        The compact form exists because decode is the vision model's bottleneck at roughly
+        22 ms per output token; it costs about 11 tokens per element against the verbose
+        form's 20.
+        """
+        normalised: list[tuple[str, list[float], float]] = []
         for item in raw_elements:
-            box = item.get("b")
-            label = item.get("l") or item.get("label")
-            if not label or not isinstance(box, list) or len(box) < 4:
-                continue
-            try:
-                x, y, w, h = self.map_box([float(v) for v in box[:4]], space)
-            except (TypeError, ValueError):
-                continue
+            if isinstance(item, list) and len(item) >= 5:
+                try:
+                    index = int(item[0])
+                    box = [float(v) for v in item[1:5]]
+                except (TypeError, ValueError):
+                    continue
+                if not vocabulary or not 0 <= index < len(vocabulary):
+                    continue
+                normalised.append((vocabulary[index], box, 1.0))
+            elif isinstance(item, dict):
+                label = item.get("l") or item.get("label")
+                box_raw = item.get("b") or item.get("box")
+                if not label or not isinstance(box_raw, list) or len(box_raw) < 4:
+                    continue
+                try:
+                    box = [float(v) for v in box_raw[:4]]
+                except (TypeError, ValueError):
+                    continue
+                try:
+                    conf = max(0.0, min(1.0, float(item.get("c", item.get("conf", 1.0)))))
+                except (TypeError, ValueError):
+                    conf = 1.0
+                normalised.append((str(label), box, conf))
+
+        space = self._resolve([box for _, box, _ in normalised])
+        out: list[Element] = []
+        for label, box, conf in normalised:
+            x, y, w, h = self.map_box(box, space)
             if w <= 0 or h <= 0:
                 continue
-            conf = item.get("c", item.get("conf", 1.0))
-            try:
-                conf = max(0.0, min(1.0, float(conf)))
-            except (TypeError, ValueError):
-                conf = 1.0
-            out.append(Element(label=str(label), x=x, y=y, w=w, h=h, conf=conf))
+            out.append(Element(label=label, x=x, y=y, w=w, h=h, conf=conf))
         return out
 
 
@@ -265,6 +297,7 @@ def parse_vision_output(
     raw: str,
     mapper: CoordinateMapper,
     *,
+    vocabulary: Sequence[str] | None = None,
     frame_id: int = 0,
     latency_ms: float = 0.0,
     max_elements: int = 8,
@@ -296,7 +329,7 @@ def parse_vision_output(
     raw_elements = data.get("e") or data.get("elements") or []
     if not isinstance(raw_elements, list):
         raw_elements = []
-    elements = mapper.map_all(raw_elements[: max_elements * 2])[:max_elements]
+    elements = mapper.map_all(raw_elements[: max_elements * 2], vocabulary)[:max_elements]
 
     texts = data.get("t") or data.get("texts") or []
     if isinstance(texts, str):

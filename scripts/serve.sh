@@ -111,8 +111,13 @@ PY
 
   echo "starting $role"
   printf '         %s\n' "$SERVER ${ARGS[*]}" | fold -sw 100 | sed '2,$s/^/         /'
-  "$SERVER" "${ARGS[@]}" >"$RUN_DIR/$role.log" 2>&1 &
+  # setsid detaches into a new session, so the server survives this script's shell
+  # exiting. A plain `&` leaves it in the caller's process group, which means it is
+  # killed the moment the calling shell is torn down -- fine interactively, fatal when
+  # serve.sh is invoked from another script, a CI job, or a tool runner.
+  setsid nohup "$SERVER" "${ARGS[@]}" >"$RUN_DIR/$role.log" 2>&1 &
   echo $! > "$RUN_DIR/$role.pid"
+  disown 2>/dev/null || true
 }
 
 launch vision   || exit 1

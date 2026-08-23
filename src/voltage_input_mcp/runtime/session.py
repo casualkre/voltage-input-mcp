@@ -46,6 +46,7 @@ from ..errors import Aborted, BurstParseError, ExpressionError, SessionError
 from ..expr import GuardContext
 from ..inputs import DeviceSet, ExecutionReport, Executor
 from ..llm import Backend, actuator_grammar, observation_grammar
+from ..llm.grammar import vision_vocabulary
 from ..llm.ollama import BURST_SCHEMA, OBSERVATION_SCHEMA
 from ..models.burst import Burst, parse_burst
 from ..models.observation import CoordinateMapper, Observation, parse_vision_output
@@ -439,6 +440,9 @@ class Session:
         return parse_vision_output(
             result.text,
             mapper,
+            # Must be the same list, in the same order, that generated the grammar --
+            # the model reports a label by its index into it.
+            vocabulary=vision_vocabulary(state.spec.watch),
             frame_id=frame.frame_id,
             latency_ms=result.latency_ms,
             max_elements=settings.max_elements,

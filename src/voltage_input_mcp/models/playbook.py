@@ -199,14 +199,28 @@ class Perception(BaseModel):
         default=0.015, ge=0.0, le=1.0, description="fraction of pixels that must differ"
     )
     max_cache_age_s: float = Field(default=2.5, ge=0.0, le=60.0)
-    max_elements: int = Field(default=6, ge=1, le=16)
+    max_elements: int = Field(
+        default=3,
+        ge=1,
+        le=16,
+        description=(
+            "how many elements the vision model may report -- THE dominant vision cost. "
+            "Decode is the bottleneck (~22 ms/token measured), and each element costs "
+            "~21 tokens, so roughly 500 ms each. Measured on Qwen2.5-VL-3B: 2 elements "
+            "~1.0 s, 4 elements ~2.2 s. Keep this at the number your guards actually "
+            "test for; raising it to 6 costs about 1.5 s per perceived cycle."
+        ),
+    )
     downscale_to: tuple[int, int] = Field(
         default=(896, 504),
         description=(
-            "image size handed to the vision model -- the single largest latency knob. "
-            "Qwen2.5-VL emits one visual token per 28x28 pixel block, so cost is "
-            "(w/28)*(h/28) tokens: 896x504=576, 784x448=448, 700x392=350, 448x252=144. "
-            "Values are snapped to multiples of 28."
+            "image size handed to the vision model. Contrary to intuition this is NOT a "
+            "significant latency knob: prefill measured ~28 ms and is flat across "
+            "448x252 through 896x504, because decode dominates. Shrinking it mostly "
+            "hurts -- a blurrier image makes the model less certain and it emits MORE "
+            "tokens (measured: 448x252 was 2.5x SLOWER than 896x504). Prefer the largest "
+            "size that fits your VRAM and tune max_elements instead. Snapped to "
+            "multiples of 28, the model's token block size."
         ),
     )
 

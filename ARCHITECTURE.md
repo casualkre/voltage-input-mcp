@@ -42,14 +42,14 @@ run, then polls. Intelligence is spent once, in advance, on the structure — no
         │  did the screen change?  ──no──▶ reuse cached observation│
         │            │ yes                                        │
         │            ▼                                            │
-        │  vision model (~250–400 ms), GBNF-constrained           │
+        │  vision model (~500 ms per element), GBNF-constrained   │
         └────────────────────────────┬───────────────────────────┘
                                      ▼
    ┌─────────────────────────────────────────────────────────────────┐
    │  1. success_when / failure_when   (runtime, no model)            │
    │  2. reflexes                      (runtime, no model)            │
    │  3. transitions                   (runtime, no model)            │
-   │  4. actuator                      (~90–200 ms, GBNF-constrained) │
+   │  4. actuator                      (~150-200 ms, GBNF-constrained)│
    └────────────────────────────┬────────────────────────────────────┘
                                 ▼
                     ┌───────────────────────────────────────┐
@@ -78,16 +78,28 @@ design is built around.
 | capture (portal stream) | ~2 ms | reading the newest frame from a slot |
 | capture (per-call) | 15–60 ms | why streaming is preferred |
 | probes | ~40 µs | 160×90 luma thumbnail diff |
-| vision, cold prompt | 350–600 ms | ~400 image tokens at 896×504 |
-| vision, cached prefix | 250–400 ms | prefill reuse via `cache_prompt` |
-| actuator, cached prefix | 90–200 ms | 20–40 output tokens under grammar |
+| vision prefill | ~28 ms | flat from 448×252 to 896×504 — image size is nearly free |
+| decode, either model | ~22 ms/token | **this is the bottleneck** |
+| vision, 2 elements | ~1.0 s | ~21 tokens per reported element |
+| vision, 4 elements | ~2.2 s | why `max_elements` defaults to 3 |
+| actuator, cached prefix | 140–400 ms | depends almost entirely on note length |
 | governor | ~50 µs | pure Python over a parsed burst |
 | burst execution | as specified | 40 inputs over 500 ms costs 500 ms |
 
-A cycle that skips vision is ~120 ms. A cycle that runs it is ~450 ms. The design's whole
-job is maximising the fraction of cycles in the first category.
+A cycle that skips vision costs about what the actuator costs (~150-200 ms tuned). A
+cycle that runs vision costs that plus ~500 ms per reported element. The design's whole
+job is maximising the fraction of cycles in the first category, and minimising the
+element count in the second.
 
-### The four levers, in order of impact
+### The levers, in order of impact
+
+**0. Fewer output tokens.** Measured, not assumed: both models are decode-bound at
+~22 ms/token, and prefill is ~28 ms regardless of image size. So the levers are
+`max_elements` (~500 ms per element), the actuator's diagnostic `note` (55% of its
+latency at the original 48-char limit), and the compact `[idx,x1,y1,x2,y2]` element
+encoding (27–29% fewer tokens than the object form). The original design assumed vision
+was prefill-bound and tuned micro-batches accordingly; that was wrong, and `voltage bench`
+is what showed it.
 
 **1. Bursts.** The unit of actuation is a programme, not an input:
 
@@ -142,7 +154,7 @@ elidx  ::= "0" | "1" | "2"                    ← exactly this cycle's element c
 target ::= "." | "type_path" | "fail"         ← exactly this state's transitions
 keyname ::= "a" | "b" | ... | "enter" | ...   ← policy allowlist minus denylist
 coord  ::= "0" | [1-9] [0-9]{0,2} | "1000"    ← vision: normalised space only
-label  ::= "address bar" | "file list" | ...  ← this state's `watch` list
+labelidx ::= "0" | "1" | "2"                  ← index into this state's `watch` list
 ```
 
 So the actuator **cannot** emit a malformed burst, name a denied key, reference an element

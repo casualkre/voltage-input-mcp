@@ -35,6 +35,7 @@ from typing import Any
 
 from .llm import actuator_grammar, observation_grammar
 from .llm.base import Backend
+from .llm.grammar import vision_vocabulary
 from .models.observation import CoordinateMapper, parse_vision_output
 from .runtime.prompts import ACTUATOR_SYSTEM, VISION_SYSTEM
 
@@ -221,7 +222,12 @@ async def compare_vision(
                 if not result.ok:
                     per_fixture.append({"fixture": fixture.name, "error": result.error})
                     break
-                obs = parse_vision_output(result.text, mapper, max_elements=6)
+                obs = parse_vision_output(
+                    result.text,
+                    mapper,
+                    vocabulary=vision_vocabulary(fixture.watch),
+                    max_elements=6,
+                )
                 found.append(
                     {
                         "labels": obs.labels,

@@ -41,15 +41,17 @@ class ModelSpec:
 
     The two roles are bottlenecked on different things and must not be tuned identically:
 
-    **Vision is prefill-bound.** A 896x504 screenshot is 576 visual tokens (Qwen2.5-VL
-    uses 14x14 patches with a 2x2 merge, so one token per 28x28 block) and the reply is
-    ~40 tokens. Essentially all of its time is the prompt pass, which wants a large
-    micro-batch so the whole image goes through in one GPU pass.
+    **Both are decode-bound.** This contradicts the obvious guess and cost a round of
+    mis-tuning to discover. A 896x504 screenshot is 576 visual tokens (Qwen2.5-VL uses
+    14x14 patches with a 2x2 merge, one token per 28x28 block), which *sounds* like the
+    dominant cost -- but measured prefill is ~28 ms and flat from 448x252 to 896x504,
+    while decode runs at ~22 ms/token. Image size is nearly free; output length is
+    everything.
 
-    **The actuator is decode-bound.** Its prompt is short and mostly cached; it emits
-    20-40 tokens one at a time. Micro-batch size is irrelevant; what matters is per-token
-    decode latency (CUDA graphs, which llama.cpp enables by default for small models) and
-    prompt-cache reuse.
+    The vision micro-batch below is therefore sized to take the whole image in one pass
+    and then left alone: it is correct, but it is not where the time goes. The knobs that
+    matter are `Perception.max_elements` (~21 tokens, ~500 ms per reported element) and
+    the actuator's `note` length.
 
     There is a third, easily missed cost: **GBNF grammar evaluation runs on the CPU, once
     per sampled token.** It sits directly on the actuator's critical path, which is why

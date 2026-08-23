@@ -136,28 +136,42 @@ an orchestrator can author one without reading this repo.
 
 ## Performance tuning
 
-The two models are bottlenecked on different things and are tuned separately.
+All numbers below are **measured** on the reference machine (RTX 3050 6 GB laptop,
+Qwen2.5-VL-3B + Qwen3-1.7B under llama.cpp), not derived.
 
-**Vision is prefill-bound.** Qwen2.5-VL emits one visual token per 28×28 pixel block, so
-input size maps to cost exactly:
+**Both models are decode-bound. Output tokens are the only lever that matters.**
 
-| `downscale_to` | visual tokens | relative prefill |
-|---|---|---|
-| 1344×756 | 1296 | 2.25× |
-| 896×504 *(default)* | 576 | 1.0× |
-| 784×448 | 448 | 0.78× |
-| 700×392 | 350 | **0.61×** |
-| 448×252 | 144 | 0.25× |
+That was a surprise — the design originally assumed vision was prefill-bound, and it
+isn't. Prefill measured **~28 ms and flat** from 448×252 to 896×504. Decode runs at
+**~22 ms/token**. So:
 
-This is the largest single lever in the system. Dropping to 700×392 removes 39% of the
-prefill for a 0.5% aspect distortion, which is harmless because `CoordinateMapper` scales
-x and y independently. Values are auto-snapped to multiples of 28 — feeding a non-multiple
-makes the model resize internally, wasting work *and* shifting grounded boxes.
+| what | cost |
+|---|---|
+| one output token | ~22 ms |
+| one reported element | ~21 tokens ≈ **500 ms** |
+| vision, 2 elements | ~1.0 s |
+| vision, 4 elements | ~2.2 s |
+| actuator, cached prefix | 140–400 ms depending on note length |
 
-**The actuator is decode-bound**, emitting 20–40 grammar-constrained tokens against a
-mostly-cached prompt. It's given more CPU threads than the vision model despite being
-fully GPU-offloaded, because **GBNF evaluation runs on the CPU once per sampled token** —
-which also means restricting `allow_keys` is a latency optimization, not just a safety one.
+Three consequences, each of which changed a default:
+
+- **`max_elements` is the dominant vision cost.** Default is **3**. Raising it to 6 adds
+  ~1.5 s per perceived cycle. Set it to the number your guards actually test for.
+- **Shrinking `downscale_to` does not help and usually hurts.** 448×252 measured *2.5×
+  slower* than 896×504 — a blurrier image makes the model less certain, so it emits more
+  tokens. Use the largest size that fits.
+- **The actuator's `note` field cost 55% of its latency.** It is purely diagnostic, and
+  at 48 chars it measured 412 ms/cycle against 184 ms at 12 chars and 140 ms at 0.
+  Default is now 12.
+
+Elements are encoded as `[label_index, x1, y1, x2, y2]` rather than
+`{"l":"address bar","b":[...],"c":0.9}` for the same reason — measured **27–29% fewer
+tokens and 32–41% lower latency**. Indexing into the closed `watch` vocabulary is also
+safer: the model cannot spell a label at all, let alone misspell one.
+
+**GBNF evaluation runs on the CPU once per sampled token**, so the actuator gets more CPU
+threads than the vision model despite being fully GPU-offloaded — and restricting
+`allow_keys` is a latency optimization, not only a safety one.
 
 Two settings that fail *silently* if wrong:
 

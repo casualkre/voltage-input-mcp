@@ -32,9 +32,26 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 
 from ..inputs import keymap as km
-from ..models.observation import FLAGS, GENERIC_LABELS
+from ..models.observation import FLAGS
 
-__all__ = ["burst_grammar", "observation_grammar", "actuator_grammar", "escape_literal"]
+__all__ = [
+    "burst_grammar", "observation_grammar", "actuator_grammar", "escape_literal",
+    "vision_vocabulary",
+]
+
+
+def vision_vocabulary(
+    labels: Sequence[str], *, include_generic: bool = True
+) -> list[str]:
+    """The ordered label vocabulary the vision grammar indexes into.
+
+    The parser must build this list identically, because the model reports a label by its
+    position here. Both sides call this function so the ordering cannot drift.
+    """
+    from ..models.observation import GENERIC_LABELS as _GENERIC
+
+    vocabulary = list(dict.fromkeys([*labels, *(_GENERIC if include_generic else ())]))
+    return vocabulary or list(_GENERIC)
 
 # Keys the actuator may name. A subset of the full keymap: enough for real UI and game
 # control, small enough to keep the grammar compact.
@@ -103,7 +120,11 @@ def actuator_grammar(
     max_actions: int = 16,
     max_text_len: int = 64,
     allow_buttons: Sequence[str] = ("l", "r", "m"),
-    note_len: int = 48,
+    # The note is purely diagnostic -- it goes in the journal and nothing reads it at
+    # runtime -- but it is generated token by token on the critical path. Measured on a
+    # 1.7B actuator: note_len 48 costs 412 ms per cycle, 12 costs 184 ms, 0 costs 140 ms.
+    # 12 characters is enough to say "save button" and cheap enough to keep on.
+    note_len: int = 12,
     n_elements: int = 0,
 ) -> str:
     """GBNF for the actuator's full reply: ``<burst>|<target>|<note>``.
@@ -252,9 +273,7 @@ def observation_grammar(
     downstream is comparing against terms the orchestrator chose rather than whatever
     noun the model happened to pick this cycle.
     """
-    vocabulary = list(dict.fromkeys([*labels, *(GENERIC_LABELS if include_generic else ())]))
-    if not vocabulary:
-        vocabulary = list(GENERIC_LABELS)
+    vocabulary = vision_vocabulary(labels, include_generic=include_generic)
 
     root = (
         'root ::= "{\\"s\\":" scene ",\\"e\\":[" elements "]"'
@@ -262,16 +281,28 @@ def observation_grammar(
         + ' flagpart "}"'
     )
 
+    # Elements are emitted as a bare array, [label_index, x1, y1, x2, y2], rather than an
+    # object with named keys and a spelled-out label.
+    #
+    # This is a latency decision, not a style one. Decode is the vision model's
+    # bottleneck at roughly 22 ms per output token (measured, not assumed -- prefill is
+    # ~28 ms and constant regardless of image size). The object form
+    #     {"l":"address bar","b":[120,44,890,72],"c":0.9}
+    # costs about 20 tokens; the array form
+    #     [0,120,44,890,72]
+    # costs about 11. At 22 ms/token that is ~200 ms saved per element, every cycle.
+    #
+    # Referring to the label by index into the closed `watch` vocabulary is also strictly
+    # safer than spelling it out: the model cannot emit a label that is not in the list,
+    # and it cannot misspell one.
     rules: list[str] = [
         root,
         f'scene ::= "\\"" [^"\\\\\\n\\r]{{0,{scene_len}}} "\\""',
         f'elements ::= (element ("," element){{0,{max(0, max_elements - 1)}}})?',
-        'element ::= "{\\"l\\":" label ",\\"b\\":[" coord "," coord "," coord "," coord'
-        ' "],\\"c\\":" conf "}"',
-        f"label ::= {_alternation(vocabulary)}",
+        'element ::= "[" labelidx "," coord "," coord "," coord "," coord "]"',
+        f"labelidx ::= {_alternation(str(i) for i in range(len(vocabulary)))}",
         # Boxes are [x1, y1, x2, y2] normalised to 0-1000.
         'coord ::= "0" | [1-9] [0-9]{0,2} | "1000"',
-        'conf ::= "0." [0-9] | "1"',
     ]
 
     if read_text:

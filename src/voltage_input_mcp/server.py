@@ -24,6 +24,7 @@ from .app import App, get_app
 from .capture import encode_png
 from .errors import VoltageError
 from .llm import observation_grammar
+from .llm.grammar import vision_vocabulary
 from .models.burst import parse_burst
 from .models.observation import CoordinateMapper, Observation, parse_vision_output
 from .models.playbook import VERB_NAMES, Playbook, playbook_from_dict
@@ -185,7 +186,11 @@ async def voltage_observe(
             origin=frame.origin,
         )
         observation = parse_vision_output(
-            result.text, mapper, latency_ms=result.latency_ms, max_elements=max_elements
+            result.text,
+            mapper,
+            vocabulary=vision_vocabulary(watch),
+            latency_ms=result.latency_ms,
+            max_elements=max_elements,
         )
         return {
             "ok": True,
