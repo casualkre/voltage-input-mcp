@@ -20,7 +20,6 @@ with the decision it produced.
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import deque
 from collections.abc import Iterable
@@ -32,8 +31,9 @@ __all__ = ["Journal", "CycleRecord", "default_journal_dir"]
 
 
 def default_journal_dir() -> Path:
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
-    return Path(base) / "voltage-input-mcp" / "runs"
+    from ..config import state_dir
+
+    return state_dir() / "runs"
 
 
 @dataclass(slots=True)

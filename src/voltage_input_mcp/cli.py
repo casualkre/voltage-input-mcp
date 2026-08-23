@@ -342,9 +342,13 @@ def cmd_bench(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    from .server import main as serve_main
+    from .server import main as serve_stdio
+    from .server import main_http
 
-    serve_main()
+    if args.http:
+        main_http(host=args.host, port=args.port, allow_remote=args.allow_remote)
+    else:
+        serve_stdio()
     return 0
 
 
@@ -417,7 +421,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bench)
 
-    p = sub.add_parser("serve", help="run the MCP server on stdio")
+    p = sub.add_parser("serve", help="run the MCP server (stdio, or HTTP for connectors)")
+    p.add_argument("--http", action="store_true", help="serve over HTTP for a custom connector")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="permit binding beyond loopback (unauthenticated desktop control -- read the docs)",
+    )
     p.set_defaults(func=cmd_serve)
 
     return parser

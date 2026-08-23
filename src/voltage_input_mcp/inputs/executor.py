@@ -18,6 +18,13 @@ left (cheap, and makes panic-stop responsive within a millisecond), then busy-sp
 the last ~1.5 ms where the scheduler cannot be trusted. The spin is bounded and only
 happens at the tail of each wait, so CPU cost is negligible.
 
+Platforms
+---------
+The executor talks to an `InputSink` (see sink.py) and does not know which platform it is
+on. `DeviceSet` implements it over uinput on Linux; `Win32Sink` implements it over
+SendInput on Windows. Everything above -- burst scheduling, timing, held-key tracking,
+abort handling -- is shared.
+
 Text
 ----
 uinput sends scancodes, so typing via keystrokes produces whatever the compositor's
@@ -26,6 +33,10 @@ wrong -- silently, which is the worst kind of wrong. `TextMode.AUTO` therefore r
 anything outside the plain-ASCII-alphanumeric range through the clipboard instead, which
 is layout-independent, unicode-safe, and O(1) rather than O(len(text)) in wall time.
 Clipboard contents are saved and restored around the paste.
+
+Windows needs none of that: SendInput's `KEYEVENTF_UNICODE` delivers a UTF-16 code unit
+directly with no layout involved, so the sink exposes a native `text()` and the executor
+prefers it when present.
 """
 
 from __future__ import annotations
@@ -56,7 +67,11 @@ from ..models.burst import (
     Wait,
 )
 from . import keymap as km
-from .uinput import DeviceSet
+from .sink import InputSink
+
+# Reverse keymap, so the US-layout ASCII table (which yields scancodes) can be expressed
+# as canonical key names for the platform-neutral sink.
+_KEYNAME_BY_CODE = {code: name for name, code in km.KEYS.items()}
 
 __all__ = ["Executor", "ExecutionReport", "TextMode", "PointerMode"]
 
@@ -119,7 +134,7 @@ class Executor:
 
     def __init__(
         self,
-        devices: DeviceSet,
+        devices: InputSink,
         *,
         dry_run: bool = True,
         text_mode: TextMode = TextMode.AUTO,
@@ -177,24 +192,16 @@ class Executor:
             self._held_buttons.clear()
             return released
         try:
-            events: list[tuple[int, int, int]] = []
             for name in list(self._held_keys):
-                code = km.resolve_key(name)
-                if code is not None:
-                    events.append((km.EV_KEY, code, 0))
+                if km.resolve_key(name) is not None:
+                    self.devices.key(name, False)
                     released.append(name)
-            if events:
-                self.devices.keyboard.emit(events)
             self._held_keys.clear()
 
-            btn_events: list[tuple[int, int, int]] = []
             for name in list(self._held_buttons):
-                code = km.BUTTONS.get(name)
-                if code is not None:
-                    btn_events.append((km.EV_KEY, code, 0))
+                if name in km.BUTTONS:
+                    self.devices.button(name, False)
                     released.append(f"btn:{name}")
-            if btn_events:
-                self.devices.pointer_abs.emit(btn_events)
             self._held_buttons.clear()
         except InputDeviceError:
             # Best-effort: if the device is already gone there is nothing to release.
@@ -329,25 +336,35 @@ class Executor:
     # -- action handlers -------------------------------------------------------------
 
     def _do_chord(self, action: KeyChord, cursor: float) -> float:
-        codes = []
+        names = []
         for name in action.keys:
-            code = km.resolve_key(name)
-            if code is None:
+            if km.resolve_key(name) is None:
                 raise InputDeviceError(f"unknown key {name!r}")
-            codes.append(code)
+            names.append(km.canonical_key(name))
 
         self._wait_until(cursor)
         if not self.dry_run:
-            # Press in order (modifiers first, as written), one atomic frame.
-            self.devices.keyboard.emit([(km.EV_KEY, c, 1) for c in codes])
+            # Press in order, modifiers first as written.
+            for name in names:
+                self.devices.key(name, True)
         hold_end = cursor + action.hold_ms / 1000.0
         self._wait_until(hold_end)
         if not self.dry_run:
             # Release in reverse, so modifiers outlive the key they modified.
-            self.devices.keyboard.emit([(km.EV_KEY, c, 0) for c in reversed(codes)])
+            for name in reversed(names):
+                self.devices.key(name, False)
         return hold_end
 
     def _do_text(self, action: TypeText, cursor: float) -> float:
+        # Windows SendInput can deliver a UTF-16 code unit directly with no layout
+        # involved, so there is nothing for the clipboard workaround to fix there.
+        native_text = getattr(self.devices, "text", None)
+        if native_text is not None and self.text_mode is not TextMode.CLIPBOARD:
+            self._wait_until(cursor)
+            if not self.dry_run:
+                native_text(action.text)
+            return cursor + len(action.text) * 0.001
+
         mode = self.text_mode
         if mode is TextMode.AUTO:
             mode = (
@@ -365,7 +382,6 @@ class Executor:
 
         t = cursor
         step = action.interval_ms / 1000.0
-        shift_code = km.KEYS["leftshift"]
         for ch in action.text:
             mapped = km.ascii_to_keys(ch)
             if mapped is None:
@@ -374,15 +390,14 @@ class Executor:
             code, needs_shift = mapped
             self._wait_until(t)
             if not self.dry_run:
-                events: list[tuple[int, int, int]] = []
-                if needs_shift:
-                    events.append((km.EV_KEY, shift_code, 1))
-                events.append((km.EV_KEY, code, 1))
-                self.devices.keyboard.emit(events)
-                release: list[tuple[int, int, int]] = [(km.EV_KEY, code, 0)]
-                if needs_shift:
-                    release.append((km.EV_KEY, shift_code, 0))
-                self.devices.keyboard.emit(release)
+                name = _KEYNAME_BY_CODE.get(code)
+                if name is not None:
+                    if needs_shift:
+                        self.devices.key("leftshift", True)
+                    self.devices.key(name, True)
+                    self.devices.key(name, False)
+                    if needs_shift:
+                        self.devices.key("leftshift", False)
             t += step
         return t
 
@@ -405,20 +420,15 @@ class Executor:
         if self.dry_run:
             return
         if self.pointer_mode is PointerMode.RELATIVE:
-            # No absolute channel available: approximate by homing to the top-left with
-            # a deliberately over-large delta, then stepping out to the target. Pointer
-            # acceleration does not apply to the clamp at 0,0, so this is exact.
+            # No absolute channel available: home to the top-left with a deliberately
+            # over-large delta, then step out to the target. Pointer acceleration does
+            # not apply to the clamp at 0,0, so this lands exactly.
             w, h = self.devices.screen
-            self.devices.pointer_rel.emit(
-                [(km.EV_REL, km.REL_X, -w * 2), (km.EV_REL, km.REL_Y, -h * 2)]
-            )
+            self.devices.move_rel(-w * 2, -h * 2)
             if x or y:
-                self.devices.pointer_rel.emit(
-                    [(km.EV_REL, km.REL_X, x), (km.EV_REL, km.REL_Y, y)]
-                )
+                self.devices.move_rel(x, y)
             return
-        ax, ay = self.devices.to_abs(x, y)
-        self.devices.pointer_abs.emit([(km.EV_ABS, km.ABS_X, ax), (km.EV_ABS, km.ABS_Y, ay)])
+        self.devices.move_abs(x, y)
 
     def _do_move_rel(self, dx: int, dy: int) -> None:
         cx, cy = self._cursor
@@ -426,52 +436,33 @@ class Executor:
         self._cursor = (max(0, min(cx + dx, w - 1)), max(0, min(cy + dy, h - 1)))
         if self.dry_run:
             return
-        events: list[tuple[int, int, int]] = []
-        if dx:
-            events.append((km.EV_REL, km.REL_X, dx))
-        if dy:
-            events.append((km.EV_REL, km.REL_Y, dy))
-        if events:
-            self.devices.pointer_rel.emit(events)
+        self.devices.move_rel(dx, dy)
 
     def _do_scroll(self, action: Scroll, cursor: float) -> float:
         t = cursor
         step = action.step_ms / 1000.0
         direction = 1 if action.amount > 0 else -1
-        lo_axis = km.REL_WHEEL if action.axis == "v" else km.REL_HWHEEL
-        hi_axis = km.REL_WHEEL_HI_RES if action.axis == "v" else km.REL_HWHEEL_HI_RES
         for _ in range(abs(action.amount)):
             self._wait_until(t)
             if not self.dry_run:
-                # Emit both resolutions in one frame. Modern toolkits read HI_RES (120
-                # units per detent) for smooth scrolling; older ones only see REL_WHEEL.
-                # Sending only one of the two makes scrolling work in some apps and not
-                # others, which is a miserable bug to chase.
-                self.devices.pointer_abs.emit(
-                    [
-                        (km.EV_REL, hi_axis, 120 * direction),
-                        (km.EV_REL, lo_axis, direction),
-                    ]
-                )
+                self.devices.scroll(direction, action.axis)
             t += step
         return t
 
     # -- primitives ------------------------------------------------------------------
 
     def _key_event(self, name: str, value: int) -> bool:
-        code = km.resolve_key(name)
-        if code is None:
+        if km.resolve_key(name) is None:
             raise InputDeviceError(f"unknown key {name!r}")
         if not self.dry_run:
-            self.devices.keyboard.emit([(km.EV_KEY, code, value)])
+            self.devices.key(km.canonical_key(name), bool(value))
         return True
 
     def _button_event(self, name: str, value: int) -> bool:
-        code = km.BUTTONS.get(name)
-        if code is None:
+        if name not in km.BUTTONS:
             raise InputDeviceError(f"unknown button {name!r}")
         if not self.dry_run:
-            self.devices.pointer_abs.emit([(km.EV_KEY, code, value)])
+            self.devices.button(name, bool(value))
         return True
 
     def _wait_until(self, deadline: float) -> None:
@@ -500,10 +491,11 @@ class Executor:
             return False
         try:
             if not self.dry_run:
-                ctrl, v = km.KEYS["leftctrl"], km.KEYS["v"]
-                self.devices.keyboard.emit([(km.EV_KEY, ctrl, 1), (km.EV_KEY, v, 1)])
+                self.devices.key("leftctrl", True)
+                self.devices.key("v", True)
                 time.sleep(0.012)
-                self.devices.keyboard.emit([(km.EV_KEY, v, 0), (km.EV_KEY, ctrl, 0)])
+                self.devices.key("v", False)
+                self.devices.key("leftctrl", False)
                 # The target app reads the clipboard asynchronously; restoring it too
                 # early hands the app the *old* contents.
                 time.sleep(0.05)

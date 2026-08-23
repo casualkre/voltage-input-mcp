@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 from ..errors import CaptureError
@@ -22,11 +23,18 @@ __all__ = [
 # KWin authorises ScreenShot2 against an allowlist of executables, so a third-party
 # process gets NoAuthorized. Its available() performs a real capture to detect that, and
 # it stays in the list because it *does* work when this runs from an authorised binary.
-AUTO_ORDER: tuple[str, ...] = ("portal", "kwin", "grim", "x11")
+AUTO_ORDER: tuple[str, ...] = (
+    ("windows",) if sys.platform == "win32" else ("portal", "kwin", "grim", "x11")
+)
 
 
 def detect_backends() -> dict[str, bool]:
     """Which backends could work here. Used by `voltage.doctor`."""
+    if sys.platform == "win32":
+        from . import windows
+
+        return {"windows": windows.available()}
+
     from . import kwin, portal, tools
 
     return {
@@ -46,9 +54,14 @@ def create_backend(
     name is honoured even if `available()` says no, so a user can force a backend and
     see the real error rather than a generic "nothing available".
     """
-    from . import kwin, portal, tools
-
     def build(name: str) -> CaptureBackend:
+        if name == "windows":
+            from . import windows
+
+            return windows.WindowsBackend()
+
+        from . import kwin, portal, tools
+
         if name == "kwin":
             return kwin.KWinBackend()
         if name == "portal":
@@ -72,6 +85,12 @@ def create_backend(
         if detected.get(name):
             return build(name)
 
+    if sys.platform == "win32":
+        raise CaptureError(
+            "screen capture failed on Windows. GDI BitBlt needs a desktop session -- it "
+            "cannot capture from a service or a disconnected RDP session.",
+            detected=detected,
+        )
     session = os.environ.get("XDG_SESSION_TYPE", "unknown")
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "unknown")
     raise CaptureError(

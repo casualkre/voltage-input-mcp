@@ -25,6 +25,8 @@ Every path funnels into `trip()`, and every path releases held input on the way 
 from __future__ import annotations
 
 import os
+import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -35,12 +37,22 @@ __all__ = ["KillSwitch", "panic_path", "write_panic", "clear_panic"]
 
 
 def _runtime_dir() -> Path:
-    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/voltage-{os.getuid()}"
-    path = Path(base) / "voltage-input-mcp"
+    """Where the panic file lives.
+
+    Must be somewhere a *different* process, possibly a different shell or an ssh
+    session, can reliably write -- that is the whole point of a file-based kill switch.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        path = Path(base) / "voltage-input-mcp"
+    else:
+        base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/voltage-{os.getuid()}"
+        path = Path(base) / "voltage-input-mcp"
     try:
         path.mkdir(parents=True, exist_ok=True)
     except OSError:
-        path = Path("/tmp") / f"voltage-input-mcp-{os.getuid()}"
+        suffix = os.getpid() if sys.platform == "win32" else os.getuid()
+        path = Path(tempfile.gettempdir()) / f"voltage-input-mcp-{suffix}"
         path.mkdir(parents=True, exist_ok=True)
     return path
 

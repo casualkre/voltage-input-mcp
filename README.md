@@ -302,6 +302,23 @@ prints what is missing. Then:
 .venv/bin/voltage doctor
 ```
 
+## Adding it as a custom connector
+
+Clients that add MCP servers by URL need HTTP rather than stdio:
+
+```bash
+voltage serve --http
+```
+
+Then add `http://127.0.0.1:8765/mcp` as a custom connector.
+
+Binding is **restricted to loopback**, and `--allow-remote` is required to change that.
+That is not boilerplate: this server exists to move the mouse, press keys and read the
+screen, and MCP has no authentication of its own. A non-loopback bind publishes
+unauthenticated remote control of your desktop. If you genuinely need it, put an
+authenticating reverse proxy in front and understand that whoever reaches the port owns
+the machine.
+
 ## Launching from an MCP client
 
 MCP clients start servers with a **sanitized environment** — `PATH`, `HOME` and little
@@ -324,14 +341,41 @@ claude mcp add voltage-input \
 `voltage_doctor` reports exactly which of these are missing, so if capture is failing that
 is the first place to look.
 
-## Requirements
+## Platforms
 
-- Linux with `/dev/uinput` (X11, Wayland, or console — it injects below the display server)
+| | input | capture | text |
+|---|---|---|---|
+| **Linux** | `/dev/uinput` (kernel evdev — works under X11, Wayland, the console, and in games reading raw input) | portal→PipeWire, KWin DBus, grim, X11 | scancodes, clipboard fallback for non-ASCII |
+| **Windows** | `SendInput` | GDI `BitBlt` | `KEYEVENTF_UNICODE` — layout-independent |
+
+Everything above the input sink — burst scheduling, timing, held-key tracking, the safety
+governor, the whole runtime — is shared. Each platform implements five methods
+(`key`, `button`, `move_abs`, `move_rel`, `scroll`); see `inputs/sink.py`.
+
+Two asymmetries worth knowing:
+
+- **Typing is more correct on Windows.** `KEYEVENTF_UNICODE` delivers a UTF-16 code unit
+  with no keyboard layout involved. Linux uinput sends *scancodes*, so punctuation on a
+  non-US layout comes out wrong — silently — which is why the clipboard fallback exists
+  there and isn't needed on Windows.
+- **Capture is more capable on Linux.** GDI `BitBlt` cannot see some hardware-overlay
+  video and full-screen exclusive games; those capture black. Run such games in
+  borderless windowed mode.
+
+On Windows, `SendInput` cannot drive windows owned by an elevated process (UIPI) — this
+fails *silently*, so `voltage doctor` reports your elevation state. DPI awareness is
+declared at import; without it every coordinate is wrong on a scaled display.
+
+### Requirements
+
+- Linux (any display server) or Windows 10/11
 - Python 3.11+
 - A GPU with ~5 GB free for the `lean` profile; `voltage profiles` shows what fits yours
 - llama.cpp for the fast path, or Ollama for a slower zero-build path
 
-Verified against KDE Plasma 6 on Wayland (KWin), CUDA, Python 3.14.
+Verified end-to-end on KDE Plasma 6 / Wayland / CUDA / Python 3.14. The Windows paths are
+implemented and type-checked but **have not been run on a Windows machine** — treat them
+as untested and report what breaks.
 
 ## MCP tools
 

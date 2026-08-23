@@ -521,14 +521,53 @@ async def voltage_journal(
 
 
 def main() -> None:
-    """stdio entry point."""
+    """stdio entry point -- what `claude mcp add` launches."""
     try:
         server.run(transport="stdio")
     finally:
-        try:
-            asyncio.run(get_app().close())
-        except Exception:  # noqa: BLE001 - shutdown is best-effort
-            pass
+        _shutdown()
+
+
+def main_http(host: str = "127.0.0.1", port: int = 8765, *, allow_remote: bool = False) -> None:
+    """HTTP entry point, for clients that add MCP servers by URL ("custom connector").
+
+    Binding is restricted to loopback unless `allow_remote` is passed explicitly.
+
+    That restriction is not boilerplate. This server's whole purpose is to move the mouse,
+    press keys, and read the screen of the machine it runs on, and MCP has no
+    authentication of its own. A non-loopback bind publishes unauthenticated remote
+    control of the desktop to the network. If you genuinely need that, put it behind a
+    reverse proxy that terminates TLS and authenticates, and understand that anyone who
+    reaches the port owns the machine.
+    """
+    if not allow_remote and host not in ("127.0.0.1", "::1", "localhost"):
+        raise SystemExit(
+            f"refusing to bind {host}: this server can control the desktop and MCP has no "
+            f"authentication. Use 127.0.0.1, or pass --allow-remote if you have put "
+            f"authentication in front of it and accept that anyone who reaches the port "
+            f"can drive this machine."
+        )
+
+    banner = f"http://{host}:{port}/mcp"
+    print(f"voltage-input MCP listening on {banner}", flush=True)
+    print("add it as a custom connector with that URL", flush=True)
+    if allow_remote:
+        print(
+            "WARNING: bound beyond loopback with no authentication -- anyone who can "
+            "reach this port can control this computer.",
+            flush=True,
+        )
+    try:
+        server.run(transport="streamable-http", host=host, port=port)
+    finally:
+        _shutdown()
+
+
+def _shutdown() -> None:
+    try:
+        asyncio.run(get_app().close())
+    except Exception:  # noqa: BLE001 - shutdown is best-effort
+        pass
 
 
 if __name__ == "__main__":

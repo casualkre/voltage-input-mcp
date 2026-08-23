@@ -360,6 +360,46 @@ class DeviceSet:
     def is_open(self) -> bool:
         return self._open
 
+    # -- input-sink interface --------------------------------------------------------
+    #
+    # These are the operations the executor actually needs. Win32Sink implements the same
+    # five methods, so the executor is platform-agnostic and neither side needs to know
+    # about evdev codes or Win32 flags.
+
+    def key(self, name: str, down: bool) -> None:
+        code = km.resolve_key(name)
+        if code is None:
+            raise InputDeviceError(f"unknown key {name!r}")
+        self.keyboard.emit([(km.EV_KEY, code, 1 if down else 0)])
+
+    def button(self, name: str, down: bool) -> None:
+        code = km.BUTTONS.get(name)
+        if code is None:
+            raise InputDeviceError(f"unknown button {name!r}")
+        self.pointer_abs.emit([(km.EV_KEY, code, 1 if down else 0)])
+
+    def move_abs(self, x: int, y: int) -> None:
+        ax, ay = self.to_abs(x, y)
+        self.pointer_abs.emit([(km.EV_ABS, km.ABS_X, ax), (km.EV_ABS, km.ABS_Y, ay)])
+
+    def move_rel(self, dx: int, dy: int) -> None:
+        events: list[tuple[int, int, int]] = []
+        if dx:
+            events.append((km.EV_REL, km.REL_X, dx))
+        if dy:
+            events.append((km.EV_REL, km.REL_Y, dy))
+        if events:
+            self.pointer_rel.emit(events)
+
+    def scroll(self, amount: int, axis: str = "v") -> None:
+        direction = 1 if amount > 0 else -1
+        lo = km.REL_WHEEL if axis == "v" else km.REL_HWHEEL
+        hi = km.REL_WHEEL_HI_RES if axis == "v" else km.REL_HWHEEL_HI_RES
+        # Both resolutions in one frame: modern toolkits read HI_RES (120 per detent),
+        # older ones only see REL_WHEEL. Sending one alone works in some apps and not
+        # others, which is a miserable bug to chase.
+        self.pointer_abs.emit([(km.EV_REL, hi, 120 * direction), (km.EV_REL, lo, direction)])
+
     def to_abs(self, x: int, y: int) -> tuple[int, int]:
         """Screen pixels -> the device's 0..ABS_MAX axis range."""
         w, h = self.screen

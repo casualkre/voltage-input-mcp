@@ -8,6 +8,7 @@ configuration this was built and verified against.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -19,12 +20,18 @@ __all__ = ["Config", "load_config", "default_config_path"]
 
 
 def default_config_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base) / "voltage-input-mcp" / "voltage.toml"
 
 
 def state_dir() -> Path:
-    base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    else:
+        base = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local/state")
     path = Path(base) / "voltage-input-mcp"
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -40,7 +47,7 @@ class Config:
     ollama_url: str = "http://127.0.0.1:11434"
 
     # -- capture ---------------------------------------------------------------------
-    capture_backend: str = "auto"                 # auto | kwin | portal | grim | x11
+    capture_backend: str = "auto"                 # auto | portal | kwin | grim | x11 | windows
     capture_cursor: bool = True
 
     # -- input -----------------------------------------------------------------------
@@ -63,7 +70,7 @@ class Config:
     def __post_init__(self) -> None:
         if self.engine not in ("llamacpp", "ollama"):
             raise ConfigError(f"engine must be 'llamacpp' or 'ollama', got {self.engine!r}")
-        if self.capture_backend not in ("auto", "kwin", "portal", "grim", "x11"):
+        if self.capture_backend not in ("auto", "kwin", "portal", "grim", "x11", "windows"):
             raise ConfigError(f"unknown capture_backend {self.capture_backend!r}")
         if self.text_mode not in ("auto", "keys", "clipboard"):
             raise ConfigError(f"unknown text_mode {self.text_mode!r}")

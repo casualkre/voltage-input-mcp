@@ -139,7 +139,11 @@ def capture(cmd: list[str], timeout: float = 6.0) -> tuple[int, str]:
 
 
 def venv_bin(name: str) -> str:
-    candidate = REPO_ROOT / ".venv" / "bin" / name
+    """Locate a venv entry point. Windows puts them in Scripts/ with a .exe suffix."""
+    if sys.platform == "win32":
+        candidate = REPO_ROOT / ".venv" / "Scripts" / f"{name}.exe"
+    else:
+        candidate = REPO_ROOT / ".venv" / "bin" / name
     return str(candidate) if candidate.exists() else name
 
 
@@ -165,11 +169,11 @@ def on_path() -> bool:
 
 
 def snapshot(config: Config) -> dict[str, object]:
-    from .inputs import probe_uinput
+    from .inputs import probe_input
 
     return {
         "config": config,
-        "uinput": bool(probe_uinput().get("ok")),
+        "uinput": bool(probe_input().get("ok")),
         "vision": server_up(int(config.vision_url.rsplit(":", 1)[-1])),
         "actuator": server_up(int(config.actuator_url.rsplit(":", 1)[-1])),
         "ollama": server_up(11434),
@@ -185,14 +189,16 @@ def status_block(state: dict[str, object]) -> None:
     config: Config = state["config"]  # type: ignore[assignment]
     engine = config.engine
     rule("status")
-    print(f"  {ok_mark(state['uinput'])} input device      {dim('/dev/uinput')}")
+    device_label = "SendInput" if sys.platform == "win32" else "/dev/uinput"
+    print(f"  {ok_mark(state['uinput'])} input device      {dim(device_label)}")
     if engine == "ollama":
         print(f"  {ok_mark(state['ollama'])} ollama            {dim(config.ollama_url)}")
     else:
         print(f"  {ok_mark(state['vision'])} vision model      {dim(config.vision_url)}")
         print(f"  {ok_mark(state['actuator'])} actuator model    {dim(config.actuator_url)}")
     print(f"  {ok_mark(state['mcp'])} mcp registered    {dim('claude mcp list')}")
-    print(f"  {ok_mark(state['path'])} voltage on PATH   {dim('~/.local/bin/voltage')}")
+    path_hint = dim("found on PATH" if state["path"] else "run guided setup to link it")
+    print(f"  {ok_mark(state['path'])} voltage on PATH   {path_hint}")
     print()
     print(f"  profile {bold(config.profile)}   engine {bold(engine)}   "
           f"dry_run {bold(str(config.dry_run))}   {len(state['models'])} model file(s)")  # type: ignore[arg-type]
@@ -217,15 +223,23 @@ def screen_setup(state: dict[str, object]) -> None:
     if not state["uinput"]:
         steps.append(("fix /dev/uinput permissions", False, _explain_uinput))
     if config.engine == "llamacpp":
-        if not state["llama"]:
-            steps.append(("build llama.cpp (~20 min)", True,
-                          lambda: run(["./scripts/build-llama.sh"])))
-        if not state["models"]:
-            steps.append((f"download {config.profile} weights", True,
-                          lambda: run(["./scripts/fetch-models.sh", config.profile])))
-        if not (state["vision"] and state["actuator"]):
-            steps.append(("start the model servers", True,
-                          lambda: run(["./scripts/serve.sh", config.profile])))
+        if sys.platform == "win32":
+            # The helper scripts are POSIX shell. On Windows the supported path is a
+            # prebuilt llama.cpp release, which is what most people use there anyway.
+            if not state["llama"]:
+                steps.append(("get llama.cpp", False, _explain_llama_windows))
+            if not (state["vision"] and state["actuator"]):
+                steps.append(("start the model servers", False, _explain_serve_windows))
+        else:
+            if not state["llama"]:
+                steps.append(("build llama.cpp (~20 min)", True,
+                              lambda: run(["./scripts/build-llama.sh"])))
+            if not state["models"]:
+                steps.append((f"download {config.profile} weights", True,
+                              lambda: run(["./scripts/fetch-models.sh", config.profile])))
+            if not (state["vision"] and state["actuator"]):
+                steps.append(("start the model servers", True,
+                              lambda: run(["./scripts/serve.sh", config.profile])))
     elif not state["ollama"]:
         steps.append(("start ollama", False, lambda: print(
             "  systemctl --user start ollama   (or: systemctl start ollama)")))
@@ -275,11 +289,26 @@ def _install_path_link() -> None:
         print(bold(f"    fish_add_path {target_dir}"))
 
 
+def _explain_llama_windows() -> None:
+    print("  Download a CUDA build of llama.cpp and put llama-server.exe on PATH:\n")
+    print(bold("    https://github.com/ggml-org/llama.cpp/releases"))
+    print(dim("    pick llama-<version>-bin-win-cuda-x64.zip"))
+    print("\n  Then fetch the weights for this profile from HuggingFace into models\\ .")
+    print(dim("  `voltage serve-models` prints the exact filenames and launch flags."))
+
+
+def _explain_serve_windows() -> None:
+    print("  `voltage serve-models` prints the two llama-server command lines for the")
+    print("  current profile, already tuned. Run each in its own terminal.\n")
+    print(dim("  Set GGML_CUDA_ENABLE_UNIFIED_MEMORY=0 first: if it is 1, a VRAM overflow"))
+    print(dim("  spills silently to system RAM and everything becomes ~10x slower."))
+
+
 def _explain_uinput() -> None:
     """Distinguish the two failure modes, which need completely different fixes."""
-    from .inputs import probe_uinput
+    from .inputs import probe_input
 
-    report = probe_uinput()
+    report = probe_input()
     print(f"  {red('input device not usable')}: {report.get('reason')}\n")
 
     if report.get("fix"):

@@ -13,7 +13,7 @@ from typing import Any
 from .capture import CaptureBackend, create_backend, detect_backends
 from .config import Config, load_config, state_dir
 from .errors import SessionError, VoltageError
-from .inputs import DeviceSet, Executor, PointerMode, TextMode, probe_uinput
+from .inputs import Executor, InputSink, PointerMode, TextMode, create_sink, probe_input
 from .llm import Backend, build_backends, detect_vram_mb, get_profile, recommend
 from .runtime import Session, SessionDeps, SessionOptions
 
@@ -24,7 +24,7 @@ class App:
     def __init__(self, config: Config | None = None) -> None:
         self.config = config or load_config()
         self._capture: CaptureBackend | None = None
-        self._devices: DeviceSet | None = None
+        self._devices: InputSink | None = None
         self._executor: Executor | None = None
         self._vision: Backend | None = None
         self._actuator: Backend | None = None
@@ -82,9 +82,9 @@ class App:
         )
         return self._screen
 
-    def devices(self) -> DeviceSet:
+    def devices(self) -> InputSink:
         if self._devices is None:
-            self._devices = DeviceSet(screen=self.screen())
+            self._devices = create_sink(self.screen())
         return self._devices
 
     def executor(self) -> Executor:
@@ -209,7 +209,7 @@ class App:
                 f"see 'Launching from an MCP client' in README.md."
             )
 
-        report["input"] = probe_uinput()
+        report["input"] = probe_input()
         report["input"]["clipboard_tool"] = (
             "wl-copy" if shutil.which("wl-copy")
             else "xclip" if shutil.which("xclip")
