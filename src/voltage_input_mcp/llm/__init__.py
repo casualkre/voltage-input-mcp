@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .base import Backend, GenerationResult
+from .custom import all_profiles, delete_custom, load_custom, profile_to_toml, save_custom
 from .grammar import actuator_grammar, burst_grammar, observation_grammar
 from .llamacpp import LlamaCppBackend
 from .ollama import BURST_SCHEMA, OBSERVATION_SCHEMA, OllamaBackend
@@ -22,6 +23,7 @@ __all__ = [
     "burst_grammar", "actuator_grammar", "observation_grammar",
     "Profile", "ModelSpec", "PROFILES", "DEFAULT_PROFILE", "get_profile", "recommend",
     "detect_vram_mb", "build_backends",
+    "all_profiles", "load_custom", "save_custom", "delete_custom", "profile_to_toml",
 ]
 
 

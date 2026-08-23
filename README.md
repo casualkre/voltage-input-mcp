@@ -258,6 +258,13 @@ Then just run:
 voltage
 ```
 
+**Setup detects what you already have and continues from there.** It does not assume a
+starting point: it probes your OS, GPU, whether llama.cpp or Ollama is installed, which
+models are already pulled, whether input and capture work, and whether the MCP server is
+registered — then plans only the steps that are actually left, and says which need a
+decision from you and which it can just do. If you already have Ollama, it uses it. If you
+have neither backend, it explains the trade-off in two lines and lets you pick.
+
 With no arguments that opens an interactive console: live status, guided setup that fixes
 whatever is not ready in dependency order, a model switcher, a config editor, one-key
 registration with Claude Code, and diagnostics. Every subcommand below still works
@@ -278,6 +285,42 @@ non-interactively, so scripts and CI are unaffected.
    ok   mcp registered    claude mcp list
    ok   voltage on PATH   ~/.local/bin/voltage
 ```
+
+### Custom model profiles
+
+The built-in profiles cover the machines this was developed against, not yours. Add your
+own from **`voltage` → profiles**, or by editing `profiles.toml` next to your config:
+
+```toml
+[my_rig]
+description = "RTX 4090"
+
+[my_rig.vision]
+hf_repo = "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF"
+hf_file = "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf"
+mmproj_file = "mmproj-Qwen2.5-VL-7B-Instruct-Q8_0.gguf"
+params_b = 7.0
+weights_mb = 4700
+n_ctx = 4096
+port = 8080
+
+[my_rig.actuator]
+hf_repo = "unsloth/Qwen3-4B-Instruct-2507-GGUF"
+hf_file = "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+params_b = 4.0
+weights_mb = 2500
+port = 8081
+```
+
+Custom profiles merge **over** the built-ins by name, so naming one `lean` retunes the
+built-in without forking the package. Use `ollama_tag` instead of `hf_repo`/`hf_file` for
+the Ollama backend.
+
+One slot is picky and one is not. **Vision must be able to emit grounded bounding boxes on
+request** — Qwen2.5-VL, Qwen3-VL, InternVL, MiniCPM-V and UI-TARS all can; a general
+captioner will describe your screen beautifully and put the boxes in the wrong place. The
+**actuator is forgiving**: under a GBNF grammar it is choosing among a handful of legal
+continuations, so almost any competent 1B+ instruct model works.
 
 ### Shell commands vs MCP tools
 

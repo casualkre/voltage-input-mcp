@@ -15,7 +15,6 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 from .config import Config, default_config_path, load_config
@@ -209,60 +208,137 @@ def status_block(state: dict[str, object]) -> None:
 
 
 def screen_setup(state: dict[str, object]) -> None:
-    """Guided fix-what-is-broken flow."""
-    clear()
-    banner()
-    rule("guided setup")
-    print("  Fixes whatever is not ready, in dependency order.\n")
+    """Detect what exists, then do only what is left."""
+    from .wizard import detect, plan_steps
 
     config: Config = state["config"]  # type: ignore[assignment]
-    steps: list[tuple[str, bool, Callable[[], None]]] = []
 
-    if not state["path"]:
-        steps.append(("put `voltage` on your PATH", True, _install_path_link))
-    if not state["uinput"]:
-        steps.append(("fix /dev/uinput permissions", False, _explain_uinput))
-    if config.engine == "llamacpp":
-        if sys.platform == "win32":
-            # The helper scripts are POSIX shell. On Windows the supported path is a
-            # prebuilt llama.cpp release, which is what most people use there anyway.
-            if not state["llama"]:
-                steps.append(("get llama.cpp", False, _explain_llama_windows))
-            if not (state["vision"] and state["actuator"]):
-                steps.append(("start the model servers", False, _explain_serve_windows))
-        else:
-            if not state["llama"]:
-                steps.append(("build llama.cpp (~20 min)", True,
-                              lambda: run(["./scripts/build-llama.sh"])))
-            if not state["models"]:
-                steps.append((f"download {config.profile} weights", True,
-                              lambda: run(["./scripts/fetch-models.sh", config.profile])))
-            if not (state["vision"] and state["actuator"]):
-                steps.append(("start the model servers", True,
-                              lambda: run(["./scripts/serve.sh", config.profile])))
-    elif not state["ollama"]:
-        steps.append(("start ollama", False, lambda: print(
-            "  systemctl --user start ollama   (or: systemctl start ollama)")))
-    if not state["mcp"]:
-        steps.append(("connect to Claude Code", True, lambda: connect_mcp(config)))
+    clear()
+    banner()
+    rule("checking what you already have")
+    print(dim("  probing...\n"))
+    env = detect()
 
+    clear()
+    banner()
+    rule("what I found")
+    print(f"  system      {bold(env.platform_label)}  {dim(env.session)}   python {env.python}")
+    if env.gpu_name:
+        vram = f"{env.vram_mb} MB" if env.vram_mb else "unknown VRAM"
+        print(f"  gpu         {bold(env.gpu_name)}  {dim(vram)}")
+    else:
+        print(f"  gpu         {yellow('none detected')} {dim('-- models will run on CPU, slowly')}")
+    print(f"  {ok_mark(env.input_ok)} input       "
+          f"{dim('SendInput' if env.platform == 'win32' else '/dev/uinput')}")
+    print(f"  {ok_mark(env.capture_ok)} capture     {dim(env.capture_backend or 'none')}")
+    print(f"  {ok_mark(bool(env.llama_server))} llama.cpp   "
+          f"{dim(env.llama_server or 'not found')}")
+    print(f"  {ok_mark(env.ollama_running)} ollama      "
+          f"{dim(f'{len(env.ollama_models)} model(s) pulled' if env.ollama_running else 'not running')}")
+    print(f"  {ok_mark(bool(env.model_files))} weights     {dim(f'{len(env.model_files)} gguf file(s)')}")
+    print(f"  {ok_mark(env.claude_cli)} claude cli  "
+          f"{dim('registered' if env.mcp_registered else 'not registered' if env.claude_cli else 'not installed')}")
+    print()
+
+    # -- choose an engine, if the user has not effectively already chosen one ---------
+    engine = config.engine
+    if not env.has_any_engine:
+        rule("pick a backend")
+        print("  Neither llama.cpp nor Ollama is installed. Two options:\n")
+        print(f"  {bold('1')}  Ollama      {dim('easiest. One installer, then two pulls.')}")
+        print(f"      {dim('No GBNF grammars, so bursts are ~2x slower and can occasionally')}")
+        print(f"      {dim('come back malformed and cost a cycle.')}")
+        print(f"  {bold('2')}  llama.cpp   {dim('faster, and grammar-constrained so malformed')}")
+        print(f"      {dim('output is impossible. Needs a build on Linux, or a prebuilt')}")
+        print(f"      {dim('release on Windows.')}\n")
+        choice = ask("which", "1")
+        engine = "ollama" if choice.strip() == "1" else "llamacpp"
+    elif env.ollama_running and not env.llama_server and engine == "llamacpp":
+        print(yellow("  Ollama is running but llama.cpp is not installed, and the config asks"))
+        print(yellow("  for llama.cpp.\n"))
+        if confirm("switch to Ollama for now?", default=True):
+            engine = "ollama"
+    if engine != config.engine:
+        config = _write_config(config, engine=engine)
+        state["config"] = config
+        print(green(f"  engine = {engine}\n"))
+
+    # -- plan -------------------------------------------------------------------------
+    steps = plan_steps(env, engine, config.profile)
     if not steps:
-        print(green("  Everything is ready. Nothing to do.\n"))
-        print("  Next: ask Claude to run " + bold("voltage_doctor") + dim("  (an MCP tool, not a shell command)"))
+        rule("ready")
+        print(green("\n  Everything is set up. Nothing to do.\n"))
+        print("  Ask Claude to run " + bold("voltage_doctor") +
+              dim("   (an MCP tool -- ask Claude, do not type it in a shell)"))
         pause()
         return
 
-    for i, (label, _auto, _fn) in enumerate(steps, 1):
-        print(f"  {i}. {label}")
+    rule(f"{len(steps)} step(s) left")
+    for i, step in enumerate(steps, 1):
+        mark = dim("[auto]") if step.automatic else yellow("[manual]")
+        sudo = red(" needs sudo") if step.needs_sudo else ""
+        print(f"  {i}. {bold(step.title)} {mark}{sudo}")
+        print(f"     {dim(step.why)}")
     print()
+    if not confirm("work through these now?", default=True):
+        return
 
-    for label, automatic, action in steps:
-        if not confirm(f"{label}?", default=automatic):
-            print(dim("  skipped\n"))
-            continue
-        action()
+    for step in steps:
         print()
+        rule(step.title)
+        print(f"  {step.why}\n")
+        if step.detail:
+            for line in step.detail.splitlines():
+                print(f"  {bold(line) if not line.startswith('http') else cyan(line)}")
+            print()
+        if not step.automatic:
+            print(dim("  This one needs you -- do it in another terminal, then continue."))
+            pause()
+            continue
+        if not confirm(f"do it? ({step.title.lower()})", default=True):
+            print(dim("  skipped"))
+            continue
+        _run_step(step, config, env)
+
+    print()
+    rule("done")
+    env = detect()
+    print(f"  {ok_mark(env.input_ok)} input   {ok_mark(env.capture_ok)} capture   "
+          f"{ok_mark(env.servers_up)} models   {ok_mark(bool(env.mcp_registered))} mcp")
+    if env.ready:
+        print(green("\n  Ready. Restart Claude Code, then ask it to run voltage_doctor."))
+    else:
+        print(yellow("\n  Some steps are still outstanding -- run setup again to pick up"))
+        print(yellow("  where it left off."))
     pause()
+
+
+def _run_step(step, config: Config, env) -> None:
+    """Execute one automatic step."""
+    profile = config.profile
+    if step.key == "path":
+        _install_path_link()
+    elif step.key == "ollama-pull":
+        from .llm import get_profile
+
+        try:
+            spec = get_profile(profile)
+            tags = [t for t in (spec.vision.ollama_tag, spec.actuator.ollama_tag) if t]
+        except KeyError:
+            tags = ["qwen2.5vl:3b", "qwen3:1.7b"]
+        for tag in tags:
+            run(["ollama", "pull", tag])
+    elif step.key == "llama":
+        run(["./scripts/build-llama.sh"])
+    elif step.key == "weights":
+        run(["./scripts/fetch-models.sh", profile])
+    elif step.key == "serve":
+        if config.engine == "ollama":
+            print(dim("  ollama serves on demand; nothing to start"))
+        else:
+            run(["./scripts/serve.sh", profile])
+    elif step.key == "mcp":
+        connect_mcp(config)
 
 
 def _install_path_link() -> None:
@@ -381,7 +457,7 @@ def connect_mcp(config: Config) -> None:
 
 
 def screen_models(state: dict[str, object]) -> None:
-    from .llm import PROFILES, detect_vram_mb, recommend
+    from .llm import all_profiles, detect_vram_mb, recommend
     from .llm.profiles import DESKTOP_RESERVE_MB, usable_vram_mb
 
     config: Config = state["config"]  # type: ignore[assignment]
@@ -396,7 +472,7 @@ def screen_models(state: dict[str, object]) -> None:
                   f"{dim(f'(reserving {DESKTOP_RESERVE_MB} MB for the desktop)')}")
             print(f"  recommended profile: {green(recommend(vram).name)}\n")
 
-        for i, profile in enumerate(PROFILES.values(), 1):
+        for i, profile in enumerate(all_profiles().values(), 1):
             mark = "*" if profile.name == config.profile else " "
             fit = "" if not vram else (
                 green("  fits") if profile.fits(budget) else red("  too big")
@@ -412,8 +488,8 @@ def screen_models(state: dict[str, object]) -> None:
         choice = ask("choice").lower()
         if choice in ("q", ""):
             return
-        if choice.isdigit() and 1 <= int(choice) <= len(PROFILES):
-            name = list(PROFILES)[int(choice) - 1]
+        if choice.isdigit() and 1 <= int(choice) <= len(all_profiles()):
+            name = list(all_profiles())[int(choice) - 1]
             config = _write_config(config, profile=name)
             state["config"] = config
             print(green(f"  profile set to {name}"))
@@ -540,6 +616,133 @@ def _write_config(config: Config, **changes: object) -> Config:
     return updated
 
 
+def screen_custom_profiles(state: dict[str, object]) -> None:
+    """Create, inspect and delete user-defined model profiles."""
+    from .llm import all_profiles, delete_custom, load_custom, save_custom
+    from .llm.custom import profiles_path
+    from .llm.profiles import Profile
+
+    while True:
+        clear()
+        banner()
+        rule("custom profiles")
+        path = profiles_path()
+        print(f"  {dim(str(path))}\n")
+        try:
+            custom = load_custom()
+            error = None
+        except Exception as exc:  # noqa: BLE001
+            custom, error = {}, str(exc)
+        if error:
+            print(red(f"  profiles.toml could not be read: {error}\n"))
+        if custom:
+            for name, profile in custom.items():
+                shadow = dim("  (shadows a built-in)") if name in (
+                    "lean", "balanced", "split", "quality", "ollama") else ""
+                print(f"  {bold(name)}{shadow}")
+                print(f"    vision   {profile.vision.label}")
+                print(f"    actuator {profile.actuator.label}   ~{profile.vram_mb} MB")
+        else:
+            print(dim("  none yet.\n"))
+            print("  A custom profile lets you use your own models -- a different quant,")
+            print("  a newer VL model, or a fine-tune. It is merged over the built-ins by")
+            print("  name, so naming one `lean` retunes the built-in without forking.\n")
+            print(dim("  The vision slot is the constrained one: it must emit grounded"))
+            print(dim("  bounding boxes. Qwen2.5-VL, Qwen3-VL, InternVL, MiniCPM-V and"))
+            print(dim("  UI-TARS all do. A general captioner will not. The actuator slot"))
+            print(dim("  is forgiving -- under a grammar, almost any 1B+ instruct model works."))
+        print()
+        print("  [n] new   [c] copy a built-in as a starting point   [e] open in $EDITOR")
+        print("  [d] delete   [q] back")
+
+        choice = ask("choice").lower()
+        if choice in ("q", ""):
+            return
+        if choice == "n":
+            _new_custom_profile()
+        elif choice == "c":
+            name = ask("built-in to copy", "lean")
+            try:
+                source = all_profiles()[name]
+            except KeyError:
+                print(red(f"  no profile {name!r}"))
+                pause()
+                continue
+            new_name = ask("new name", f"my_{name}")
+            copied = Profile(
+                name=new_name, description=f"copy of {name}",
+                vision=source.vision, actuator=source.actuator,
+                min_vram_mb=source.min_vram_mb, notes=source.notes,
+                actuator_on_cpu=source.actuator_on_cpu,
+            )
+            save_custom(copied)
+            print(green(f"  wrote {new_name} to {path}"))
+            print(dim("  use [e] to edit the model files and ports"))
+            pause()
+        elif choice == "e":
+            editor = os.environ.get("EDITOR") or ("notepad" if sys.platform == "win32" else "nano")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text("# Custom profiles. See [c] to copy a built-in.\n")
+            run([editor, str(path)], quiet=True)
+        elif choice == "d":
+            name = ask("delete which")
+            if name and confirm(f"delete {name}?"):
+                delete_custom(name)
+                print(green("  deleted"))
+                pause()
+
+
+def _new_custom_profile() -> None:
+    from .llm import save_custom
+    from .llm.profiles import ModelSpec, Profile
+
+    print()
+    rule("new profile")
+    name = ask("profile name (letters, digits, underscore)")
+    if not name or not name.replace("_", "").isalnum():
+        print(red("  invalid name"))
+        pause()
+        return
+
+    backend = ask("models come from: (h)uggingface gguf or (o)llama", "h").lower()
+    specs = {}
+    for role, port in (("vision", 8080), ("actuator", 8081)):
+        print(f"\n  {bold(role)} model")
+        if role == "vision":
+            print(dim("    must be able to emit bounding boxes on request"))
+        if backend.startswith("o"):
+            tag = ask("  ollama tag", "qwen2.5vl:3b" if role == "vision" else "qwen3:1.7b")
+            specs[role] = ModelSpec(
+                role=role, label=tag, hf_repo="", hf_file="", ollama_tag=tag,
+                params_b=float(ask("  size in billions of params", "3")),
+                weights_mb=int(ask("  approx weights MB", "2000")),
+                n_ctx=int(ask("  context", "2048")), port=port,
+            )
+        else:
+            repo = ask("  huggingface repo (owner/name)")
+            file = ask("  gguf filename")
+            mmproj = ask("  mmproj filename (vision only, blank if none)", "") if role == "vision" else ""
+            specs[role] = ModelSpec(
+                role=role, label=ask("  display label", file or repo),
+                hf_repo=repo, hf_file=file,
+                mmproj_repo=repo if mmproj else None, mmproj_file=mmproj or None,
+                params_b=float(ask("  size in billions of params", "3")),
+                weights_mb=int(ask("  approx weights MB", "2000")),
+                n_ctx=int(ask("  context", "2048")), port=port,
+            )
+
+    profile = Profile(
+        name=name, description=ask("description", "custom profile"),
+        vision=specs["vision"], actuator=specs["actuator"], min_vram_mb=0,
+    )
+    path = save_custom(profile)
+    print(green(f"\n  saved to {path}"))
+    print(f"  estimated VRAM: {bold(str(profile.vram_mb))} MB")
+    print(dim("  select it from the models screen, then fetch its weights"))
+    pause()
+
+
 def screen_test(state: dict[str, object]) -> None:
     while True:
         clear()
@@ -648,6 +851,7 @@ def run_console() -> int:
               f"{'' if ready else yellow('   <- start here')}")
         print(f"  {bold('2')}  models       {dim('switch profile, fetch, serve, benchmark')}")
         print(f"  {bold('3')}  config       {dim('edit settings')}")
+        print(f"  {bold('p')}  profiles     {dim('add your own models')}")
         print(f"  {bold('4')}  connect      {dim('register with Claude Code')}")
         print(f"  {bold('5')}  diagnostics  {dim('doctor, capture, calibrate')}")
         print(f"  {bold('6')}  help         {dim('shell commands vs MCP tools')}")
@@ -664,6 +868,8 @@ def run_console() -> int:
             screen_models(state)
         elif choice == "3":
             screen_config(state)
+        elif choice == "p":
+            screen_custom_profiles(state)
         elif choice == "4":
             clear()
             banner()

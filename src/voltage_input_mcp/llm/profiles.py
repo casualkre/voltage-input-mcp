@@ -368,11 +368,15 @@ DEFAULT_PROFILE = "lean"
 
 
 def get_profile(name: str) -> Profile:
+    """Look up a profile, custom ones included."""
+    from .custom import all_profiles
+
+    available = all_profiles()
     try:
-        return PROFILES[name]
+        return available[name]
     except KeyError:
         raise KeyError(
-            f"unknown profile {name!r}; available: {', '.join(PROFILES)}"
+            f"unknown profile {name!r}; available: {', '.join(available)}"
         ) from None
 
 
@@ -395,9 +399,11 @@ def recommend(
     """Largest profile that fits alongside a running desktop."""
     if prefer_ollama:
         return PROFILES["ollama"]
+    from .custom import all_profiles
+
     budget = usable_vram_mb(vram_mb, reserve_mb)
     ordered = sorted(
-        (p for p in PROFILES.values() if p.name != "ollama"),
+        (p for p in all_profiles().values() if p.name != "ollama"),
         key=lambda p: -p.vram_mb,
     )
     for profile in ordered:

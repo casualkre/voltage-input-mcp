@@ -289,7 +289,7 @@ def cmd_compare(args: argparse.Namespace) -> int:
 
 
 def cmd_profiles(args: argparse.Namespace) -> int:
-    from .llm import PROFILES, detect_vram_mb, recommend
+    from .llm import all_profiles, detect_vram_mb, recommend
     from .llm.profiles import DESKTOP_RESERVE_MB, usable_vram_mb
 
     vram = detect_vram_mb()
@@ -300,7 +300,7 @@ def cmd_profiles(args: argparse.Namespace) -> int:
         print(f"recommended:   {recommend(vram).name}\n")
     else:
         print("no CUDA GPU detected\n")
-    for profile in PROFILES.values():
+    for profile in all_profiles().values():
         fits = "" if not vram else ("  fits" if profile.fits(budget) else "  TOO BIG")
         print(f"{profile.name:<10} ~{profile.vram_mb:>5} MB{fits}   {profile.description}")
         print(f"{'':<10} vision={profile.vision.label}  actuator={profile.actuator.label}")
