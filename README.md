@@ -295,9 +295,22 @@ yourself.
 
 ## Install
 
+From nothing to working, two commands:
+
 ```bash
-cd voltage-input-mcp && ./scripts/setup.sh
+git clone https://github.com/casualkre/voltage-input-mcp && cd voltage-input-mcp && ./install.sh
 ```
+
+```bash
+voltage setup
+```
+
+`install.sh` handles Python, system packages, the venv and your PATH, and prints the exact
+`sudo` lines for anything needing root rather than asking for it. `voltage setup` then
+detects what you already have, downloads only what is missing, starts the model servers,
+and registers with your AI client — **running each step, not describing it**. Ten to
+twenty-five minutes, nearly all of it download time. Safe to re-run; it picks up where it
+left off.
 
 Then just run:
 

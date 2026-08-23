@@ -297,12 +297,11 @@ def instructions(client_key: str, info: ConnectionInfo) -> list[tuple[str, str]]
         return steps
 
     if client_key == "claude-code":
-        steps.append((
-            "Run this. The -e flags matter: without them screen capture fails silently "
-            "while input still works.",
-            claude_code_command(info),
-        ))
-        steps.append(("Restart Claude Code, then ask it to run voltage_doctor.", ""))
+        steps.append(("Register the server -- one command, copy it whole:",
+                      claude_code_command(info)))
+        steps.append(("Restart Claude Code. Servers load at session start.", ""))
+        steps.append(("Confirm it worked:", "claude mcp get voltage-input"))
+        steps.append(("Then ask Claude (do not type this in a shell): voltage_doctor", ""))
         return steps
 
     if client_key == "claude-desktop":
@@ -317,7 +316,7 @@ def instructions(client_key: str, info: ConnectionInfo) -> list[tuple[str, str]]
         return steps
 
     hint = next((c.config_hint for c in CLIENTS if c.key == client_key), "its MCP config")
-    steps.append((f"Open the client's MCP config: {hint}", ""))
-    steps.append(("Add this server entry:", stdio_json(info)))
+    steps.append(("Print the entry (and copy it):", "voltage connect --json"))
+    steps.append((f"Paste it into {hint}:", stdio_json(info)))
     steps.append(("Restart the client.", ""))
     return steps

@@ -343,6 +343,97 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0 if "error" not in report else 1
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Go from nothing to working, running each step rather than describing it."""
+    import subprocess
+
+    from .connect import claude_code_command, gather
+    from .wizard import detect, plan_steps
+
+    root = Path(__file__).resolve().parents[2]
+
+    def run(cmd: list[str]) -> int:
+        print(f"\n$ {' '.join(cmd)}\n")
+        try:
+            return subprocess.call(cmd, cwd=str(root))
+        except (OSError, KeyboardInterrupt):
+            return 1
+
+    print("checking what you already have...\n")
+    env = detect()
+    config = load_config(args.config)
+
+    print(f"  system    {env.platform_label}   {env.session}")
+    print(f"  gpu       {env.gpu_name or 'none detected'}"
+          f"{f'  {env.vram_mb} MB' if env.vram_mb else ''}")
+    print(f"  input     {'ok' if env.input_ok else 'NOT READY'}")
+    print(f"  capture   {'ok via ' + env.capture_backend if env.capture_ok else 'NOT READY'}")
+    print(f"  engine    {config.engine}   profile {config.profile}")
+
+    steps = plan_steps(env, config.engine, config.profile)
+    if not steps:
+        print("\nEverything is already set up. Try:  voltage doctor")
+        return 0
+
+    print(f"\n{len(steps)} step(s) remaining:\n")
+    for i, step in enumerate(steps, 1):
+        tag = "" if step.automatic else "   (needs you)"
+        print(f"  {i}. {step.title}{tag}")
+        print(f"     {step.why}")
+    if not args.yes:
+        print("\nRun them?  [Y/n] ", end="", flush=True)
+        try:
+            if input().strip().lower().startswith("n"):
+                return 0
+        except (EOFError, KeyboardInterrupt):
+            return 0
+
+    for step in steps:
+        print(f"\n{'=' * 72}\n{step.title}\n{'=' * 72}")
+        if not step.automatic:
+            print(f"\n  {step.why}")
+            if step.detail:
+                for line in step.detail.splitlines():
+                    print(f"    {line}")
+            print("\n  Do that, then re-run `voltage setup` to continue.")
+            continue
+        if step.key == "path":
+            from .tui import _install_path_link
+
+            _install_path_link()
+        elif step.key == "ollama-pull":
+            from .llm import get_profile
+
+            spec = get_profile(config.profile)
+            for tag in (spec.vision.ollama_tag, spec.actuator.ollama_tag):
+                if tag:
+                    run(["ollama", "pull", tag])
+        elif step.key == "llama":
+            run(["./scripts/build-llama.sh"])
+        elif step.key == "weights":
+            run(["./scripts/fetch-models.sh", config.profile])
+        elif step.key == "serve":
+            run(["./scripts/serve.sh", config.profile])
+        elif step.key == "mcp":
+            info = gather()
+            command = claude_code_command(info)
+            print("\nRegistering with Claude Code:")
+            print(f"\n$ {command}\n")
+            subprocess.call(command, shell=True)
+
+    print(f"\n{'=' * 72}")
+    env = detect()
+    print(f"input {'ok' if env.input_ok else 'NO'}   "
+          f"capture {'ok' if env.capture_ok else 'NO'}   "
+          f"models {'ok' if env.servers_up else 'NO'}   "
+          f"mcp {'ok' if env.mcp_registered else 'NO'}")
+    if env.ready:
+        print("\nReady. Restart your AI client, then ask it to run voltage_doctor.")
+    else:
+        print("\nSome steps are outstanding -- re-run `voltage setup` to continue.")
+    return 0
+
+
 def cmd_instructions(args: argparse.Namespace) -> int:
     """Show, set, or clear the standing instructions sent to the orchestrator."""
     from .briefing import instructions_path, load_instructions, save_instructions
@@ -376,6 +467,12 @@ def cmd_connect(args: argparse.Namespace) -> int:
     info = gather(port=args.port)
     if args.json:
         print(stdio_json(info))
+        return 0
+
+    if args.write_desktop:
+        from .tui import _write_desktop_config
+
+        _write_desktop_config(info)
         return 0
 
     if args.client:
@@ -505,6 +602,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_bench)
 
+    p = sub.add_parser("setup", help="go from nothing to working; safe to re-run")
+    p.add_argument("-y", "--yes", action="store_true", help="do not ask before running")
+    p.set_defaults(func=cmd_setup)
+
     p = sub.add_parser(
         "instructions", help="standing instructions given to the orchestrator"
     )
@@ -515,6 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("connect", help="show URLs and per-client MCP setup instructions")
     p.add_argument("--client", help="print steps for one client (see the list it prints)")
     p.add_argument("--json", action="store_true", help="print the mcpServers entry only")
+    p.add_argument("--write-desktop", action="store_true",
+                   help="write the Claude Desktop config (backs up any existing file)")
     p.add_argument("--port", type=int, default=8765)
     p.set_defaults(func=cmd_connect)
 
