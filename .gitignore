@@ -1,12 +1,14 @@
-.venv/
-vendor/
-models/
+# Paths are anchored with a leading slash so they match only at the repository root.
+# An unanchored `models/` also matches src/voltage_input_mcp/models/ and silently
+# excludes the source package -- which is exactly what happened once.
+/.venv/
+/vendor/
+/models/
+/fixtures/        # eval fixtures are real screenshots of your desktop; keep them local
+/screen.png
+
 *.egg-info/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-screen.png
-
-# eval fixtures are real screenshots of your desktop -- keep them local
-fixtures/

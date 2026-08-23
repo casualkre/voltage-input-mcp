@@ -1,0 +1,633 @@
+"""The Playbook: the contract between the orchestrator and the two small models.
+
+This is the most important schema in the project, because it is where the division of
+labour is actually enforced.
+
+The orchestrating model is smart but slow and remote. The local models are fast but
+genuinely limited -- a 1.7B actuator will not reason its way out of an ambiguous
+situation, and a 3B vision model will confabulate if asked an open question. So the
+orchestrator does not hand them a goal and hope. It hands them a **state machine**:
+
+  * The orchestrator decides *what the states are*, *what to look for in each*, *what is
+    permitted in each*, and *exactly when to move on*. That is the thinking.
+  * The vision model answers one closed question per cycle: "of these specific things,
+    which are on screen and where?"
+  * The actuator answers one closed question per cycle: "given that, which inputs?"
+
+Transitions are evaluated by **this process**, not by a model -- they are guard
+expressions the orchestrator wrote (see expr.py). The actuator may only *propose* a
+transition already listed in the current state. It cannot invent control flow.
+
+Reserved transition targets
+---------------------------
+    @success   end the run, report success
+    @failure   end the run, report failure
+    @stop      end the run, no verdict (used for "human should look at this")
+
+Everything else must name a state in `states`.
+"""
+
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from ..errors import PlaybookError
+from ..expr import Guard
+from .burst import Burst, parse_burst
+
+__all__ = [
+    "Playbook",
+    "State",
+    "Transition",
+    "ReflexRule",
+    "ProbeSpec",
+    "Policy",
+    "Budget",
+    "Perception",
+    "Rect",
+    "CompiledPlaybook",
+    "compile_playbook",
+    "TERMINALS",
+]
+
+TERMINALS: frozenset[str] = frozenset({"@success", "@failure", "@stop"})
+
+VERBS: tuple[str, ...] = ("k", "d", "u", "t", "g", "m", "r", "c", "p", "e", "s", "h", "w")
+VERB_NAMES: dict[str, str] = {
+    "k": "key chord",
+    "d": "key down",
+    "u": "key up",
+    "t": "type text",
+    "g": "move to seen element",
+    "m": "absolute move",
+    "r": "relative move",
+    "c": "click",
+    "p": "button down",
+    "e": "button up",
+    "s": "scroll",
+    "h": "horizontal scroll",
+    "w": "wait",
+}
+
+Ident = Annotated[str, Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,39}$")]
+
+
+class Rect(BaseModel):
+    """An axis-aligned screen region in pixels."""
+
+    model_config = ConfigDict(frozen=True)
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    w: int = Field(gt=0)
+    h: int = Field(gt=0)
+
+    def contains(self, px: int, py: int) -> bool:
+        return self.x <= px < self.x + self.w and self.y <= py < self.y + self.h
+
+    def as_tuple(self) -> tuple[int, int, int, int]:
+        return self.x, self.y, self.w, self.h
+
+
+class ProbeSpec(BaseModel):
+    """A cheap, model-free screen measurement, evaluated every frame in ~microseconds.
+
+    Probes are what let the loop run faster than the vision model. Anything that can be
+    reduced to "is this pixel red" or "has this region changed" should be a probe, not a
+    question for the VLM. Reflex rules fire off probes with no model in the path at all.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: Ident
+    type: Literal["pixel", "region_mean", "region_diff", "brightness", "template"]
+    at: tuple[int, int] | None = Field(default=None, description="pixel probes: (x, y)")
+    region: Rect | None = Field(default=None, description="region probes: area to measure")
+    expect: str | None = Field(
+        default=None, pattern=r"^#?[0-9a-fA-F]{6}$", description="pixel/region_mean: target colour"
+    )
+    tolerance: int = Field(default=30, ge=0, le=255)
+    template: str | None = Field(default=None, description="template: path to a PNG")
+    threshold: float = Field(default=0.85, ge=0.0, le=1.0)
+    channel: Literal["rgb", "r", "g", "b", "luma"] = "rgb"
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> ProbeSpec:
+        if self.type == "pixel":
+            if self.at is None:
+                raise ValueError("pixel probe needs `at`")
+            if self.expect is None:
+                raise ValueError("pixel probe needs `expect`")
+        elif self.type in ("region_mean", "region_diff", "brightness"):
+            if self.region is None:
+                raise ValueError(f"{self.type} probe needs `region`")
+            if self.type == "region_mean" and self.expect is None:
+                raise ValueError("region_mean probe needs `expect`")
+        elif self.type == "template":
+            if self.template is None or self.region is None:
+                raise ValueError("template probe needs `template` and a search `region`")
+        return self
+
+
+class ReflexRule(BaseModel):
+    """A deterministic, model-free rule: condition -> burst.
+
+    Reflexes run on every captured frame, between actuator decisions. This is the second
+    half of the latency answer: bursts give you many inputs per decision, reflexes give
+    you inputs with no decision at all. A reflex should only depend on probes and cached
+    observation state, never on anything that needs fresh vision.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    id: Ident
+    when: str = Field(description="guard expression, e.g. probe('health') < 0.25")
+    do: str = Field(description="burst to execute, e.g. k:q;w:60")
+    cooldown_ms: int = Field(default=500, ge=0, le=60_000)
+    max_fires: int | None = Field(default=None, ge=1)
+    priority: int = Field(default=0, description="higher wins when several fire at once")
+    exclusive: bool = Field(
+        default=True, description="if true, suppress the actuator this cycle when it fires"
+    )
+
+
+class Transition(BaseModel):
+    """A guarded edge out of a state, evaluated by the runtime, not by a model."""
+
+    model_config = ConfigDict(frozen=True)
+
+    when: str = Field(description="guard expression; the first true transition wins")
+    to: str = Field(description="target state name, or @success / @failure / @stop")
+    set: dict[str, int | float | str | bool] = Field(
+        default_factory=dict, description="variable assignments applied on the way out"
+    )
+    inc: dict[str, int | float] = Field(
+        default_factory=dict, description="variable increments applied on the way out"
+    )
+    note: str | None = Field(default=None, max_length=200)
+
+    @field_validator("to")
+    @classmethod
+    def _valid_target(cls, v: str) -> str:
+        if v in TERMINALS:
+            return v
+        if not v.replace("_", "").isalnum() or not v[0].isalpha():
+            raise ValueError(f"invalid transition target {v!r}")
+        return v
+
+
+class Perception(BaseModel):
+    """How hard to look, and how often.
+
+    `mode` is the main latency lever:
+
+      always     run the vision model every cycle. Highest fidelity, slowest.
+      on_change  run it only when a frame-diff probe says the screen materially moved,
+                 otherwise reuse the cached observation. Default, and usually 3-6x faster
+                 because most cycles in a real task look at a static screen.
+      cadence    run it every Nth cycle regardless.
+      never      probes and reflexes only. For pure timing/muscle-memory sequences.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    mode: Literal["always", "on_change", "cadence", "never"] = "on_change"
+    cadence: int = Field(default=3, ge=1, le=60)
+    change_threshold: float = Field(
+        default=0.015, ge=0.0, le=1.0, description="fraction of pixels that must differ"
+    )
+    max_cache_age_s: float = Field(default=2.5, ge=0.0, le=60.0)
+    max_elements: int = Field(default=6, ge=1, le=16)
+    downscale_to: tuple[int, int] = Field(
+        default=(896, 504),
+        description=(
+            "image size handed to the vision model -- the single largest latency knob. "
+            "Qwen2.5-VL emits one visual token per 28x28 pixel block, so cost is "
+            "(w/28)*(h/28) tokens: 896x504=576, 784x448=448, 700x392=350, 448x252=144. "
+            "Values are snapped to multiples of 28."
+        ),
+    )
+
+    @field_validator("downscale_to")
+    @classmethod
+    def _snap_to_patch_grid(cls, value: tuple[int, int]) -> tuple[int, int]:
+        """Round to a multiple of 28, the vision model's effective token block size.
+
+        Qwen2.5-VL uses 14x14 ViT patches with a 2x2 spatial merge, so each output token
+        covers 28x28 pixels. Handing it dimensions that are not multiples of 28 makes it
+        resize internally: work is wasted on pixels that are then discarded, and the
+        rescale shifts grounded boxes slightly relative to what we think we sent. Snapping
+        here is free and strictly better.
+        """
+        w, h = value
+        snapped = (max(28, round(w / 28) * 28), max(28, round(h / 28) * 28))
+        return snapped
+    read_text: bool = Field(default=True, description="ask the VLM to transcribe key text")
+    region: Rect | None = Field(
+        default=None, description="crop the capture before perception; cheaper and sharper"
+    )
+
+
+class Policy(BaseModel):
+    """Hard limits. The governor enforces every field here on every burst.
+
+    Defaults are deliberately restrictive. A playbook opts *into* capability rather than
+    out of danger, because the thing generating bursts is a 1.7B model.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    allow_verbs: list[str] = Field(default_factory=lambda: list(VERBS))
+    allow_keys: list[str] | None = Field(
+        default=None, description="if set, ONLY these key names may be pressed"
+    )
+    deny_keys: list[str] = Field(
+        default_factory=lambda: [
+            "delete", "sysrq", "power", "sleep", "compose", "leftmeta", "rightmeta",
+        ]
+    )
+    deny_chords: list[str] = Field(
+        default_factory=lambda: [
+            "ctrl+alt+delete", "ctrl+alt+backspace", "alt+f4", "ctrl+q",
+            "ctrl+shift+q", "ctrl+alt+f1", "ctrl+alt+f2", "meta+l",
+        ]
+    )
+    deny_text: list[str] = Field(
+        default_factory=lambda: [
+            r"rm\s+-[rf]", r"\bsudo\b", r"\bmkfs\b", r"\bdd\s+if=", r":\s*\(\)\s*\{.*\|.*&\s*\}",
+            r"\bchmod\s+777\b", r"\bcurl\b.*\|\s*(ba)?sh", r"\bgit\s+push\b.*--force",
+        ],
+        description="regexes; a burst typing anything matching is refused",
+    )
+    deny_labels: list[str] = Field(
+        default_factory=lambda: [
+            "delete", "trash", "remove", "confirm", "purchase", "buy", "pay", "send",
+            "approve", "allow", "grant", "accept", "uninstall", "format", "erase",
+            "sign in", "log in", "password",
+        ],
+        description="clicking an observed element whose label matches is refused",
+    )
+    click_allow_regions: list[Rect] = Field(
+        default_factory=list, description="if non-empty, clicks must land inside one of these"
+    )
+    click_deny_regions: list[Rect] = Field(default_factory=list)
+    require_target_element: bool = Field(
+        default=False,
+        description="clicks must land on an element the vision layer actually reported",
+    )
+    max_actions_per_burst: int = Field(default=32, ge=1, le=128)
+    max_burst_ms: int = Field(default=1500, ge=1, le=15_000)
+    max_inputs_per_second: float = Field(default=60.0, gt=0, le=500.0)
+    max_text_len: int = Field(default=256, ge=0, le=2048)
+    allow_held_keys: bool = Field(
+        default=True, description="permit d:/p: without a matching release inside the burst"
+    )
+    max_hold_ms: int = Field(
+        default=4000, ge=0, le=30_000, description="auto-release anything held longer"
+    )
+    dry_run: bool = Field(
+        default=True,
+        description="parse, validate and journal bursts but never touch the input device",
+    )
+
+    @field_validator("allow_verbs")
+    @classmethod
+    def _known_verbs(cls, v: list[str]) -> list[str]:
+        unknown = sorted(set(v) - set(VERBS))
+        if unknown:
+            raise ValueError(f"unknown verbs {unknown}; valid: {list(VERBS)}")
+        return v
+
+
+class Budget(BaseModel):
+    """Run-level stop conditions. Every one of these is a hard abort."""
+
+    model_config = ConfigDict(frozen=True)
+
+    max_cycles: int = Field(default=240, ge=1, le=100_000)
+    max_seconds: float = Field(default=180.0, gt=0, le=86_400)
+    max_bursts: int = Field(default=240, ge=1, le=100_000)
+    max_rejections: int = Field(
+        default=12, ge=0, description="abort after this many governor refusals"
+    )
+    idle_abort_s: float = Field(
+        default=25.0, ge=0, description="abort if the screen never changes for this long"
+    )
+    deadman_s: float = Field(
+        default=6.0, ge=0.5, le=120.0,
+        description="abort if a single cycle wedges for this long; releases all held input",
+    )
+
+
+class State(BaseModel):
+    """One node of the machine.
+
+    `brief` and `hint` are the entire instruction the actuator receives. Write them as
+    imperatives with concrete nouns from `watch`. The actuator has no memory of the goal
+    beyond what is in the prompt, and no ability to reason about what the state is *for*.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    brief: str = Field(max_length=280, description="imperative instruction for the actuator")
+    watch: list[str] = Field(
+        default_factory=list, max_length=12,
+        description="the closed vocabulary of things the vision model may report here",
+    )
+    hint: str | None = Field(default=None, max_length=280)
+    allow_verbs: list[str] | None = Field(
+        default=None, description="narrow the policy's verb set for this state only"
+    )
+    on_enter: str | None = Field(default=None, description="burst run once on entry")
+    on_exit: str | None = Field(default=None, description="burst run once on exit")
+    reflex: list[ReflexRule] = Field(default_factory=list, max_length=16)
+    transitions: list[Transition] = Field(default_factory=list, max_length=16)
+    perception: Perception | None = Field(default=None, description="per-state override")
+    max_cycles: int | None = Field(default=None, ge=1, le=10_000)
+    timeout_s: float | None = Field(default=None, gt=0, le=3600)
+    on_timeout: str | None = Field(
+        default=None, description="state to jump to when max_cycles/timeout_s trips"
+    )
+    autonomous: bool = Field(
+        default=True,
+        description="if false, the actuator is skipped and only reflexes/on_enter run",
+    )
+
+    @field_validator("allow_verbs")
+    @classmethod
+    def _known_verbs(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        unknown = sorted(set(v) - set(VERBS))
+        if unknown:
+            raise ValueError(f"unknown verbs {unknown}; valid: {list(VERBS)}")
+        return v
+
+
+class Playbook(BaseModel):
+    """The complete task specification handed to `voltage.run`."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: Ident
+    goal: str = Field(max_length=600, description="human-readable; not shown to the small models")
+    version: int = 1
+    initial: str
+    states: dict[str, State] = Field(min_length=1, max_length=64)
+    vars: dict[str, int | float | str | bool] = Field(default_factory=dict, max_length=32)
+    probes: list[ProbeSpec] = Field(default_factory=list, max_length=24)
+    policy: Policy = Field(default_factory=Policy)
+    budget: Budget = Field(default_factory=Budget)
+    perception: Perception = Field(default_factory=Perception)
+    success_when: str | None = Field(
+        default=None, description="global guard; checked every cycle before transitions"
+    )
+    failure_when: str | None = Field(default=None, description="global abort guard")
+    notes: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("states")
+    @classmethod
+    def _no_reserved_names(cls, v: dict[str, State]) -> dict[str, State]:
+        for name in v:
+            if name in TERMINALS or name.startswith("@"):
+                raise ValueError(f"state name {name!r} is reserved")
+            if not name.replace("_", "").isalnum() or not name[0].isalpha():
+                raise ValueError(f"invalid state name {name!r}")
+        return v
+
+    @model_validator(mode="after")
+    def _initial_exists(self) -> Playbook:
+        if self.initial not in self.states:
+            raise ValueError(
+                f"initial state {self.initial!r} is not defined; have: {sorted(self.states)}"
+            )
+        return self
+
+
+# --------------------------------------------------------------------------------------
+# Compilation
+# --------------------------------------------------------------------------------------
+
+
+class CompiledState:
+    """A state with its guards and bursts pre-parsed, ready for the hot loop."""
+
+    __slots__ = (
+        "name", "spec", "transitions", "reflexes", "on_enter", "on_exit", "allow_verbs",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        spec: State,
+        transitions: list[tuple[Guard, Transition]],
+        reflexes: list[tuple[Guard, Burst, ReflexRule]],
+        on_enter: Burst | None,
+        on_exit: Burst | None,
+        allow_verbs: frozenset[str],
+    ) -> None:
+        self.name = name
+        self.spec = spec
+        self.transitions = transitions
+        self.reflexes = reflexes
+        self.on_enter = on_enter
+        self.on_exit = on_exit
+        self.allow_verbs = allow_verbs
+
+    @property
+    def vocabulary(self) -> list[str]:
+        return list(self.spec.watch)
+
+
+class CompiledPlaybook:
+    """A validated playbook whose guards and bursts are parsed exactly once."""
+
+    __slots__ = ("spec", "states", "success", "failure", "probe_ids", "warnings")
+
+    def __init__(
+        self,
+        spec: Playbook,
+        states: dict[str, CompiledState],
+        success: Guard | None,
+        failure: Guard | None,
+        warnings: list[str],
+    ) -> None:
+        self.spec = spec
+        self.states = states
+        self.success = success
+        self.failure = failure
+        self.probe_ids = frozenset(p.id for p in spec.probes)
+        self.warnings = warnings
+
+    def state(self, name: str) -> CompiledState:
+        try:
+            return self.states[name]
+        except KeyError:
+            raise PlaybookError(f"no such state {name!r}") from None
+
+    def perception_for(self, name: str) -> Perception:
+        override = self.states[name].spec.perception
+        return override or self.spec.perception
+
+
+def _compile_guard(source: str, where: str, errors: list[str]) -> Guard | None:
+    try:
+        return Guard(source)
+    except Exception as exc:  # noqa: BLE001 - collect all errors, do not stop at the first
+        errors.append(f"{where}: {exc}")
+        return None
+
+
+def _compile_burst(source: str, where: str, errors: list[str]) -> Burst | None:
+    try:
+        return parse_burst(source)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"{where}: {exc}")
+        return None
+
+
+def compile_playbook(spec: Playbook) -> CompiledPlaybook:
+    """Fully validate a playbook: guards compile, bursts parse, graph is sound.
+
+    Raises `PlaybookError` listing *every* problem found, not just the first -- the
+    orchestrator should be able to fix a playbook in one round trip rather than N.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    known_states = set(spec.states)
+    probe_ids = {p.id for p in spec.probes}
+    base_verbs = frozenset(spec.policy.allow_verbs)
+
+    success = _compile_guard(spec.success_when, "success_when", errors) if spec.success_when else None
+    failure = _compile_guard(spec.failure_when, "failure_when", errors) if spec.failure_when else None
+
+    compiled: dict[str, CompiledState] = {}
+    reachable: set[str] = {spec.initial}
+
+    for name, st in spec.states.items():
+        where = f"states.{name}"
+        watch = set(st.watch)
+
+        transitions: list[tuple[Guard, Transition]] = []
+        for i, tr in enumerate(st.transitions):
+            guard = _compile_guard(tr.when, f"{where}.transitions[{i}].when", errors)
+            if guard is None:
+                continue
+            if tr.to not in TERMINALS and tr.to not in known_states:
+                errors.append(
+                    f"{where}.transitions[{i}].to: unknown state {tr.to!r}; "
+                    f"have {sorted(known_states)} plus {sorted(TERMINALS)}"
+                )
+            else:
+                reachable.add(tr.to)
+            missing_labels = guard.referenced_labels - watch
+            if missing_labels:
+                warnings.append(
+                    f"{where}.transitions[{i}] tests for {sorted(missing_labels)} but they are "
+                    f"not in this state's `watch` list, so the vision model can never report "
+                    f"them and this transition can never fire"
+                )
+            missing_probes = guard.referenced_probes - probe_ids
+            if missing_probes:
+                errors.append(
+                    f"{where}.transitions[{i}] uses undefined probes {sorted(missing_probes)}"
+                )
+            transitions.append((guard, tr))
+
+        reflexes: list[tuple[Guard, Burst, ReflexRule]] = []
+        seen_reflex_ids: set[str] = set()
+        for i, rx in enumerate(st.reflex):
+            if rx.id in seen_reflex_ids:
+                errors.append(f"{where}.reflex[{i}]: duplicate reflex id {rx.id!r}")
+            seen_reflex_ids.add(rx.id)
+            guard = _compile_guard(rx.when, f"{where}.reflex[{i}].when", errors)
+            burst = _compile_burst(rx.do, f"{where}.reflex[{i}].do", errors)
+            if guard is None or burst is None:
+                continue
+            missing_probes = guard.referenced_probes - probe_ids
+            if missing_probes:
+                errors.append(f"{where}.reflex[{i}] uses undefined probes {sorted(missing_probes)}")
+            reflexes.append((guard, burst, rx))
+        reflexes.sort(key=lambda item: -item[2].priority)
+
+        on_enter = _compile_burst(st.on_enter, f"{where}.on_enter", errors) if st.on_enter else None
+        on_exit = _compile_burst(st.on_exit, f"{where}.on_exit", errors) if st.on_exit else None
+
+        verbs = frozenset(st.allow_verbs) & base_verbs if st.allow_verbs else base_verbs
+        if st.allow_verbs and not verbs:
+            errors.append(
+                f"{where}.allow_verbs is disjoint from policy.allow_verbs, so no action is "
+                f"possible in this state"
+            )
+
+        if st.on_timeout and st.on_timeout not in TERMINALS and st.on_timeout not in known_states:
+            errors.append(f"{where}.on_timeout: unknown state {st.on_timeout!r}")
+        elif st.on_timeout:
+            reachable.add(st.on_timeout)
+
+        if st.autonomous and not st.transitions and not st.max_cycles and not st.timeout_s:
+            warnings.append(
+                f"{where} has no transitions and no cycle/time limit; it can only be left "
+                f"by the run budget expiring"
+            )
+        if st.autonomous and not st.watch and not probe_ids:
+            warnings.append(
+                f"{where} is autonomous but has an empty `watch` list and there are no probes, "
+                f"so the actuator will act blind"
+            )
+
+        compiled[name] = CompiledState(
+            name=name,
+            spec=st,
+            transitions=transitions,
+            reflexes=reflexes,
+            on_enter=on_enter,
+            on_exit=on_exit,
+            allow_verbs=verbs,
+        )
+
+    orphans = known_states - reachable
+    if orphans:
+        warnings.append(f"unreachable states: {sorted(orphans)}")
+
+    if not spec.success_when and not any(
+        tr.to == "@success" for st in spec.states.values() for tr in st.transitions
+    ):
+        warnings.append(
+            "no path to @success: this run can only end via budget, failure, or manual stop"
+        )
+
+    if errors:
+        raise PlaybookError(
+            f"playbook {spec.name!r} has {len(errors)} error(s)",
+            errors=errors,
+            warnings=warnings,
+        )
+
+    return CompiledPlaybook(spec, compiled, success, failure, warnings)
+
+
+def strip_comments(value: Any) -> Any:
+    """Drop underscore-prefixed keys anywhere in the structure.
+
+    JSON has no comment syntax, and a playbook is a document a human and a model both
+    have to read. `"_comment_policy": "..."` is the established convention for annotating
+    one, so it is honoured here rather than colliding with `extra="forbid"`.
+    """
+    if isinstance(value, dict):
+        return {k: strip_comments(v) for k, v in value.items() if not str(k).startswith("_")}
+    if isinstance(value, list):
+        return [strip_comments(v) for v in value]
+    return value
+
+
+def playbook_from_dict(data: dict[str, Any]) -> CompiledPlaybook:
+    """Validate + compile in one step, normalising pydantic errors into PlaybookError."""
+    try:
+        spec = Playbook.model_validate(strip_comments(data))
+    except Exception as exc:  # noqa: BLE001 - pydantic ValidationError has a huge repr
+        raise PlaybookError("playbook failed schema validation", errors=[str(exc)]) from exc
+    return compile_playbook(spec)
