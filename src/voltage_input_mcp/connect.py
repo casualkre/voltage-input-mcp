@@ -305,14 +305,13 @@ def instructions(client_key: str, info: ConnectionInfo) -> list[tuple[str, str]]
         return steps
 
     if client_key == "claude-desktop":
-        path = desktop_config_path()
-        steps.append(("Open (or create) this file:", str(path)))
-        steps.append((
-            "Add the voltage-input entry. If the file already has an mcpServers block, "
-            "merge this one into it rather than replacing it.",
-            stdio_json(info),
-        ))
-        steps.append(("Fully quit Claude Desktop and reopen it.", ""))
+        steps.append(("Write the config for me -- backs up anything already there:",
+                      "voltage connect --write-desktop"))
+        steps.append(("Fully quit Claude Desktop and reopen it. Reloading is not enough.",
+                      ""))
+        steps.append(("Prefer to do it by hand? Open this file:",
+                      str(desktop_config_path())))
+        steps.append(("...and merge this into it:", stdio_json(info)))
         return steps
 
     hint = next((c.config_hint for c in CLIENTS if c.key == client_key), "its MCP config")
