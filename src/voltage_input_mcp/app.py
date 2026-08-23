@@ -275,6 +275,18 @@ class App:
             "known": list(self.sessions),
         }
 
+        # Surface a configured-vs-running profile disagreement here too: doctor is
+        # where people look, and the mismatch is otherwise silent.
+        try:
+            from .briefing import active_build
+
+            build = active_build()
+            report["active_build"] = build
+            if build.get("mismatch"):
+                report["models"]["mismatch"] = build["mismatch"]
+        except Exception:  # noqa: BLE001
+            pass
+
         report["ready"] = bool(
             report["input"].get("ok")
             and report["capture"].get("health", {}).get("ok")

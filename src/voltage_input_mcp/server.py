@@ -21,6 +21,7 @@ from mcp.server.mcpserver import Image, MCPServer
 from mcp.types import ToolAnnotations
 
 from .app import App, get_app
+from .briefing import active_build, briefing_text
 from .capture import encode_png
 from .errors import VoltageError
 from .llm import observation_grammar
@@ -31,23 +32,37 @@ from .models.playbook import VERB_NAMES, Playbook, playbook_from_dict
 from .runtime import Session
 from .runtime.prompts import VISION_SYSTEM
 
-server = MCPServer(
-    name="voltage-input",
-    version="0.1.0",
-    instructions=(
+
+def _instructions() -> str:
+    """Built at startup so it describes the configuration actually running.
+
+    The same Playbook can be sound on one build and wrong on another -- grammars are
+    enforced on llama.cpp and absent on Ollama, and the `hyper` profile cannot ground at
+    all -- and none of that is visible to a remote orchestrator. Stating it up front is
+    cheaper than a tool call it may not think to make.
+    """
+    base = (
         "Two-layer input engine. You are the orchestrator: you write a Playbook -- a "
         "state machine with guards, limits and a safety policy -- and two small local "
         "models execute it, one reading the screen and one emitting timed input bursts.\n"
         "\n"
-        "Call voltage_reference first if you have not written a Playbook before. Call "
-        "voltage_doctor to confirm the machine is ready. Playbooks run in dry_run by "
-        "default: they parse, check and journal every burst without touching the input "
-        "device, so validate a playbook that way before setting dry_run=false.\n"
+        "Start with voltage_reference(section='loop') for the iteration loop, and "
+        "section='bursts' for how to chain inputs well. voltage_doctor confirms the "
+        "machine is ready. After a run that did not do what you wanted, call "
+        "voltage_diagnose rather than reading the journal by hand.\n"
         "\n"
         "The local models are small and take instructions literally. Give each state a "
         "short imperative brief, a closed list of things to look for, and explicit "
-        "transitions. Do not expect them to infer intent."
-    ),
+        "transitions. Do not expect them to infer intent.\n"
+    )
+    briefing = briefing_text()
+    return f"{base}\n{briefing}" if briefing else base
+
+
+server = MCPServer(
+    name="voltage-input",
+    version="0.1.0",
+    instructions=_instructions(),
 )
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
@@ -113,7 +128,9 @@ async def voltage_reference(
         LEARNING_LOOP,
     )
 
-    out: dict[str, Any] = {"ok": True}
+    # Always included, regardless of section: the profile can change mid-session, and
+    # the copy in the server instructions was fixed at startup.
+    out: dict[str, Any] = {"ok": True, "active_build": active_build()}
     if section in ("all", "loop"):
         out["learning_loop"] = LEARNING_LOOP
     if section in ("all", "bursts"):

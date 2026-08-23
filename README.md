@@ -524,6 +524,44 @@ Verified end-to-end on KDE Plasma 6 / Wayland / CUDA / Python 3.14. The Windows 
 implemented and type-checked but **have not been run on a Windows machine** — treat them
 as untested and report what breaks.
 
+## The orchestrator is told which build it is driving
+
+The same Playbook is sound on one configuration and wrong on another, and a remote model
+cannot see which. So the server's MCP instructions are **built at startup from the live
+configuration**, and carry only the lines that change how a Playbook should be written:
+
+```
+ACTIVE BUILD: Linux · llamacpp · profile lean
+  vision Qwen2.5-VL-3B-Instruct · actuator Qwen3-1.7B
+  loaded: Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf / Qwen3-1.7B-Q4_K_M.gguf
+  expected cycle 280-700 ms
+
+- llama.cpp backend: both models are grammar-constrained. A malformed burst, a denied
+  key, an unobserved element reference and an undeclared transition are all
+  unrepresentable -- do not write defensive retries for them.
+- Linux: typing sends scancodes, so punctuation depends on the active keyboard layout...
+- dry_run defaults to true...
+```
+
+On Ollama that first line becomes a warning that bursts are *not* constrained. On `hyper`
+it becomes "do not build states around `sees()`". On Windows it notes that elevated
+windows are unreachable and typing is layout-independent.
+
+**It verifies against the running servers rather than trusting the config.** Switching
+profiles edits a file; it does not restart anything. When they disagree, the briefing says
+so loudly and suppresses the profile-derived guidance, because that guidance would
+describe models that are not loaded:
+
+```
+- MISMATCH -- Profile 'hyper' does not match what is loaded. vision: profile expects
+  SmolVLM-Instruct-Q4_K_M.gguf, server has Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf...
+- Loaded right now: vision Qwen2.5-VL-3B..., actuator Qwen3-1.7B...
+  Judge grounding quality from those.
+```
+
+`voltage_reference` returns the current build on every call, since the startup copy goes
+stale the moment a profile changes.
+
 ## MCP tools
 
 | Tool | Purpose |

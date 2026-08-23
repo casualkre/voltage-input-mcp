@@ -76,6 +76,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"               fix: {info['fix']}")
     if models.get("warning"):
         print(f"  warning      {models['warning']}")
+    if models.get("mismatch"):
+        print(f"  MISMATCH     {models['mismatch']}")
 
     for step in report.get("next_steps", []):
         print(f"  ->  {step}")
