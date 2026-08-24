@@ -169,17 +169,35 @@ class ModelSpec:
         # `hint` routinely contains the exact burst we want the model to emit, sitting
         # right there in the context for an n-gram lookup to copy.
         #
-        # Measured on Qwen3-1.7B over 33 realistic grammar-constrained cycles:
+        # Measured on Qwen3-1.7B, three interleaved on/off runs of 41 cycles each so that
+        # any drift over the session hits both arms equally:
         #
-        #     baseline        p50 311 ms   mean 472 ms   p95 1123 ms
-        #     n-max 8         p50 296 ms   mean 392 ms   p95  835 ms   38.8% accepted
-        #     n-max 3         p50 297 ms   mean 375 ms   p95  846 ms   31.8% accepted
+        #                 p50      mean     p95
+        #     off        242 ms   353 ms   881 ms
+        #     on         276 ms   328 ms   671 ms
+        #
+        # Read that carefully, because it is not the shape people expect and an unpaired
+        # measurement got it wrong here first. **Speculation makes the median 14% worse
+        # and the tail 24% better.** The separation is clean in both directions -- every
+        # off-run's p50 beat every on-run's, and every off-run's p95 lost to every
+        # on-run's.
+        #
+        # That is mechanically exactly right. On a short reply the draft is verification
+        # work with nothing to gain, so it costs. On a long one it skips many decode
+        # steps, so it pays. The trade is worth taking because the tail is what makes a
+        # loop stutter: a 900 ms cycle is felt and a 240-vs-276 ms cycle is not.
         #
         # n-max 3 rather than the default because acceptance collapses with depth --
         # measured per position: 72, 49, 49, 14, 14, 14, 6, 6. Positions beyond the third
-        # contribute almost nothing and every one of them is verification work. The gain
-        # lands in the tail, which is the right place: p95 is what a burst that pads
-        # itself out costs, and the mean is what the loop actually feels.
+        # contribute almost nothing and every one is verification work.
+        #
+        # Everything else in this file's tuning space -- kv-unified, ubatch, thread count,
+        # stacked n-gram types, context size -- was swept and lands **inside the
+        # run-to-run noise** on this hardware. One sweep ranked a combination 22% ahead of
+        # the baseline; the confirmation run ranked the same combination 22% behind it.
+        # Sequential single-shot sweeps confound the config with the moment it ran. Do not
+        # trust a config ranking from this harness without interleaved repeats, and do not
+        # spend more time on these knobs: the remaining wins here are structural.
         if self.speculative:
             args += ["--spec-type", "ngram-cache", "--spec-draft-n-max", "3"]
 

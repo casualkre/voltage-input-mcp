@@ -64,6 +64,7 @@ from ..models.template import BurstTemplate
 from ..safety import Governor, KillSwitch, Verdict
 from .journal import CycleRecord, Journal
 from .prompts import ACTUATOR_SYSTEM, VISION_SYSTEM, actuator_prompt, vision_prompt
+from .recall import CacheEntry, PolicyCache, situation_key
 from .tuner import Tunable, Tuner
 
 __all__ = ["Session", "SessionOptions", "SessionDeps", "RunStatus"]
@@ -94,6 +95,9 @@ class SessionOptions:
     # costs almost nothing and is what makes air control or a dodge possible at all.
     reflex_hz: float = 20.0
     reflex_enabled: bool = True
+    # Recall the actuator's past decisions for situations that repeat. Costs one
+    # nearest-neighbour scan over a small bucket; saves a model round trip on every hit.
+    recall_enabled: bool = True
 
 
 # The reflex loop is the only thing that captures, so it must not be allowed to eat the
@@ -246,6 +250,11 @@ class Session:
         self._episode_index = 0
         self._episode_start_value = 0.0
         self._episode_started_at = 0.0
+
+        # Recall: the actuator's own past decisions, keyed by situation. Every hit is a
+        # model round trip that does not happen.
+        self.recall = PolicyCache(enabled=self.options.recall_enabled)
+        self._last_recall: tuple = ((), {})
         self._timings: dict[str, list[float]] = {"capture": [], "vision": [], "actuator": [],
                                                  "execute": [], "cycle": [], "reflex": []}
 
@@ -882,6 +891,22 @@ class Session:
         centres = [e.center for e in observation.elements]
         targets = self._legal_targets(state)
 
+        # Have we already answered this exact question? The actuator's decision is a
+        # function of the state, what is on screen, and the readings -- all of which
+        # recur constantly in a game loop. A hit returns the model's own previous answer
+        # to a situation this close, in microseconds instead of ~300 ms.
+        recall_key = situation_key(
+            state.name, [e.label for e in observation.elements], targets
+        )
+        recall_vector = self._recall_vector(percept.probes or self.probes.last)
+        self._last_recall = (recall_key, recall_vector)
+        remembered = self.recall.lookup(recall_key, recall_vector)
+        if remembered is not None:
+            await self._replay_remembered(
+                remembered, observation, state, targets, centres, record
+            )
+            return
+
         policy = self.playbook.spec.policy
         max_actions = min(policy.max_actions_per_burst, 20)
         max_text_len = min(policy.max_text_len, 96)
@@ -984,6 +1009,15 @@ class Session:
             self._last_result = f"failed: {report.error}"
         else:
             self._last_result = "ok"
+            # Remember it only now: parsed, allowed by the governor, and executed
+            # without error. Anything short of that would teach the table to repeat a
+            # failure faster than it made it.
+            self.recall.store(
+                *self._last_recall,
+                burst=burst_str,
+                proposed_state=proposed if proposed in targets else None,
+                note=note,
+            )
 
         # The actuator may only propose transitions the state already declares; the
         # grammar restricts it to `targets`, and this re-checks in case a non-grammar
@@ -996,6 +1030,66 @@ class Session:
                 record.note = (
                     f"{note} [ignored illegal transition to {proposed!r}]".strip()
                 )
+
+    def _recall_vector(self, probes: dict[str, float]) -> dict[str, float]:
+        """The continuous part of a situation, as the cache sees it.
+
+        Only the playbook's declared probes and their rates. The engine's internals are
+        excluded on purpose: `__static_for__` grows without bound, so including it would
+        make every situation drift steadily away from every stored one and the cache
+        would never hit twice.
+        """
+        wanted = self.playbook.probe_ids
+        return {
+            key: value
+            for key, value in probes.items()
+            if key in wanted or key.removesuffix("__rate") in wanted
+            if not key.startswith("__")
+        }
+
+    async def _replay_remembered(
+        self,
+        entry: CacheEntry,
+        observation: Observation,
+        state: CompiledState,
+        targets: list[str],
+        centres: list[tuple[int, int]],
+        record: CycleRecord,
+    ) -> None:
+        """Execute a decision recalled from the cache, with the full safety path intact.
+
+        Deliberately not a shortcut around the governor. A remembered burst is re-parsed
+        and re-reviewed against *this* cycle's observation and policy, because what made
+        it safe last time was the situation, and the situation is only approximately the
+        same. Skipping that would make the cache a hole in the safety model.
+        """
+        record.burst_source = "recall"
+        record.burst = entry.burst
+        record.note = entry.note
+        try:
+            burst = parse_burst(entry.burst, screen=self.deps.screen, elements=centres)
+        except BurstParseError as exc:
+            # The stored burst referenced an element index this cycle does not have.
+            record.error = f"recalled burst no longer parses: {exc.detail}"
+            self.recall.penalise(*self._last_recall)
+            return
+
+        report, verdict = await self._guarded_execute(
+            burst, observation, state, source="recall"
+        )
+        record.allowed = verdict.allowed
+        record.violations = [v.as_dict() for v in verdict.violations]
+        record.executed = bool(report and report.ok and not self.dry_run)
+        self._last_burst = entry.burst
+        self._last_result = "ok" if verdict.allowed else "refused"
+        if not verdict.allowed:
+            self.recall.penalise(*self._last_recall)
+            return
+
+        proposed = entry.proposed_state
+        if proposed and proposed in targets:
+            record.transition = proposed
+            await self._goto(proposed, state, record)
 
     async def _guarded_execute(
         self,
@@ -1102,6 +1196,10 @@ class Session:
             reward = delta
 
         params = dict(self._tune_params)
+        # An episode that scored worse than the running best is evidence against the
+        # decisions that produced it. One cycle cannot know this; the episode can.
+        if self._tuner.best_score is not None and reward < self._tuner.best_score * 0.5:
+            self.recall.penalise(*self._last_recall)
         self._tuner.record(reward, seconds=seconds, note=note)
         self.journal.event(
             "episode",
@@ -1396,6 +1494,7 @@ class Session:
             "bursts": self._bursts,
             "reflex": self.reflex_summary(),
             "tuner": self.tuner_summary(),
+            "recall": self.recall.stats(),
             "held": sorted(self.deps.executor.held_names()),
             "elapsed_s": round(elapsed, 1),
             "vars": dict(self.vars),
