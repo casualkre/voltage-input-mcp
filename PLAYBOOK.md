@@ -172,14 +172,33 @@ A `number` probe OCRs a HUD figure into a real value:
   "region": {"x": 1642, "y": 96, "w": 190, "h": 44}, "ocr_interval_ms": 90 }
 ```
 
-OCR is 80–200 ms, so it runs on a background worker and a guard reads the last value in
-microseconds — never waiting, at most one round trip stale. Each number probe also
-publishes a derivative, so `rate('meters')` is descent speed with no differencing in the
-Playbook.
+Each number probe also publishes a derivative, so `rate('meters')` is descent speed with
+no differencing in the Playbook.
 
-> A number probe that cannot read returns `0.0`, which no guard can distinguish from a HUD
-> that genuinely reads zero. Check the `ocr` line in `voltage doctor` before trusting a
-> threshold; on most distributions tesseract's language data is a separate package.
+### Teach it the digits — don't leave it on OCR
+
+By default a number probe uses tesseract: 80–200 ms, on a background worker, and
+**approximate**. Measured against a real game HUD it read `414` as `4114` and `0` as
+`636`. A reflex guarding on `probe('meters') < 90` cannot survive input that wrong, and no
+amount of tuning the guard fixes a lying sensor.
+
+A HUD is one font, one size, one place, ten glyphs. So teach it once:
+
+```bash
+voltage learn-digits meters --region 16 636 150 50 --seconds 20
+```
+
+Make the number **change** while that runs — a score climbing, an altitude counting down —
+so every digit shows up. It clusters the glyph shapes, uses OCR once as a *teacher* (voted
+across frames, so a single misread cannot decide a label), and saves the set.
+
+After that the probe reads by correlation: **~1 ms, exact, and inline** rather than on a
+background worker, so the value is from *this* frame. Name the glyph set after the probe
+and it is picked up automatically, or set `"glyphs": "meters"` explicitly.
+
+> When no glyph clears threshold the probe keeps its last value and stops advancing
+> `<id>__age` — so a latch guarding on it goes blind and releases, rather than the probe
+> inventing a number. That is the intended behaviour when a modal covers the HUD.
 
 ### Reflexes: `do` and `hold`
 

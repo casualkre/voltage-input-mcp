@@ -39,6 +39,15 @@ CONTINUOUS_CONTROL: dict[str, Any] = {
                            "is the only layer that can react to something that happens "
                            "in less than half a second.",
     },
+    "teach_it_the_digits": (
+        "A number probe defaults to OCR: 80-200 ms, on a background worker, and "
+        "approximate -- measured against a real game HUD it read 414 as 4114 and 0 as "
+        "636. A guard cannot survive input that wrong. Run "
+        "`voltage learn-digits <name> --region X Y W H` once while the number is "
+        "changing, and the probe switches to glyph matching: ~1 ms, exact, and inline "
+        "rather than one round trip stale. This is the single biggest reliability fix "
+        "available for any playbook that reads numbers."
+    ),
     "probes_first": (
         "A reflex is only as good as what it can measure, and the vision model is far too "
         "slow to be in that path. Declare a probe for every quantity a fast rule needs. "
