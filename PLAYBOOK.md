@@ -162,21 +162,82 @@ VLM.
 ]
 ```
 
-Types: `pixel`, `region_mean`, `brightness`, `region_diff`, `template`. All return 0.0–1.0.
-Use `voltage_capture` to find real coordinates for your display.
+Types: `pixel`, `region_mean`, `brightness`, `region_diff`, `template`, `number`. The first
+five return 0.0–1.0. Use `voltage_capture` to find real coordinates for your display.
 
-A reflex is a rule that fires on probes with **no model in the path at all**, between
-actuator decisions:
+A `number` probe OCRs a HUD figure into a real value:
 
 ```json
-"reflex": [
-  { "id": "heal", "when": "probe('health') < 0.25", "do": "k:q;w:80",
-    "cooldown_ms": 2500, "priority": 10, "exclusive": true }
-]
+{ "id": "meters", "type": "number",
+  "region": {"x": 1642, "y": 96, "w": 190, "h": 44}, "ocr_interval_ms": 90 }
 ```
 
-`exclusive: true` suppresses the actuator that cycle. Higher `priority` wins when several
-fire. This is how a 2 Hz decision loop produces sub-100 ms reactions.
+OCR is 80–200 ms, so it runs on a background worker and a guard reads the last value in
+microseconds — never waiting, at most one round trip stale. Each number probe also
+publishes a derivative, so `rate('meters')` is descent speed with no differencing in the
+Playbook.
+
+> A number probe that cannot read returns `0.0`, which no guard can distinguish from a HUD
+> that genuinely reads zero. Check the `ocr` line in `voltage doctor` before trusting a
+> threshold; on most distributions tesseract's language data is a separate package.
+
+### Reflexes: `do` and `hold`
+
+A reflex fires on probes with **no model in the path at all**, in its own loop at
+`reflex_hz` (default 20) between actuator decisions. There are two kinds, and picking the
+wrong one is the most common way a Playbook looks right and behaves wrong.
+
+**`do` is a one-shot.** Guard goes true, burst runs, cooldown starts.
+
+```json
+{ "id": "heal", "when": "probe('health') < 0.25", "do": "k:q;w:80",
+  "cooldown_ms": 2500, "priority": 10, "exclusive": true }
+```
+
+`exclusive: true` suppresses the next decision, so a burst chosen from a 300 ms-old frame
+cannot override a reaction made 20 ms ago. Higher `priority` wins when several match.
+
+**`hold` is a latch.** The keys go down on the rising edge and stay down — across frames,
+across decisions — until the guard goes false.
+
+```json
+{ "id": "glide", "when": "probe('meters') > 50",
+  "release_when": "probe('meters') < 25", "hold": "w, shift" }
+```
+
+Use it for anything continuous: running, mouse-look, holding a drag open, charging an
+attack. Written as a repeated `do`, "hold W while the target is ahead" becomes a stutter of
+taps at 20 Hz, which on screen is a character twitching in place rather than moving.
+
+`release_when` is a *separate, wider* falling threshold. The gap between the two is a dead
+band in which neither fires and the latch keeps its state — a Schmitt trigger. Without it a
+guard sitting on its threshold flips at reflex rate; `voltage_diagnose` reports that as
+`latch_chatter`. `min_hold_ms` is the blunter alternative.
+
+Latches are released on state exit, on pause and on stop, and are exempt from the
+`max_hold_ms` watchdog — a guard re-checked twenty times a second is stricter supervision
+than a timer.
+
+### Expressions inside bursts
+
+A Playbook-authored burst may contain `{expression}` holes, evaluated when it fires:
+
+```json
+{ "id": "steer", "when": "probe('mph') > 25",
+  "do": "r:{clamp((probe('mph') - 60) * 4, -220, 220)},0", "cooldown_ms": 70 }
+```
+
+That is a proportional controller in one line, running at reflex rate. Holes work in reflex
+`do`, `on_enter` and `on_exit` — not in what the actuator emits, which stays literal and
+grammar-bounded, because that is what makes a bad burst unrepresentable rather than
+unlikely.
+
+**Always `clamp()` a term that becomes a coordinate.** An unclamped servo overshoots off
+the edge of the screen and the fire is dropped rather than the pointer being sent
+somewhere arbitrary.
+
+See `examples/air_control.json` for all of this in one place, and
+`voltage_reference(section='control')` for the full treatment.
 
 ---
 
@@ -285,6 +346,13 @@ are allowed — spend vision where it matters.
 | run ends "screen has not changed" | stuck | add a `stalled()` transition |
 | typed text comes out wrong | scancodes vs. keyboard layout | install `wl-clipboard`; `text_mode="auto"` |
 | cursor does not move at all | pointer classification | `voltage_calibrate`, then `pointer_mode="relative"` |
+| mouse-look does nothing in a game | absolute motion fights pointer lock | set `policy.pointer_mode: "relative"` |
+| everything happens at ~2 Hz | no probes, no reflexes | see `no_fast_layer` in `voltage_diagnose` |
+| a reflex never fires | threshold or region wrong | `reflex_never_fired` lists each probe's peak value |
+| reactions arrive late | actuator bursts hog the device | lower `max_burst_ms`; see `reflex_starved` |
+| a held key machine-guns | guard sitting on its threshold | add `release_when`; see `latch_chatter` |
+| a number probe always reads 0 | OCR unavailable, or wrong region | `voltage doctor` → `ocr` line, then `voltage_capture` |
+| the fast loop runs slower than asked | non-streaming capture backend | `voltage doctor`; `portal` streams, `kwin` does not |
 
 Live correction without restarting:
 
@@ -306,3 +374,13 @@ voltage_steer(dry_run=false)
 - [ ] `allow_keys` is set if this is a game
 - [ ] There is a path to `@success`
 - [ ] Validated, then dry-run, then journal read — before `dry_run=false`
+
+If anything in this task has timing in it:
+
+- [ ] Every quantity a fast rule needs is a probe, not a question for the vision model
+- [ ] Anything continuous is a `hold`, not a repeated `do`
+- [ ] Every `hold` has a `release_when` wider than its `when`, or a `min_hold_ms`
+- [ ] Every `{...}` hole that becomes a coordinate is wrapped in `clamp()`
+- [ ] `max_burst_ms` is short — a 500 ms burst is 500 ms in which nothing can react
+- [ ] After the dry run, `voltage_diagnose`'s `reflex` block shows `fires > 0`,
+      `starved == 0`, and `measured_hz` close to `requested_hz`

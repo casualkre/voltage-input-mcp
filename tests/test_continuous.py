@@ -316,21 +316,40 @@ def key_events(sink: Sink, name: str) -> list[bool]:
     return [down for kind, key, down in sink.events if kind == "key" and key == name]
 
 
+async def until(predicate, timeout: float = 3.0, label: str = "") -> None:
+    """Wait for a condition instead of for a duration.
+
+    These tests drive two real asyncio loops at 50 Hz, so a fixed sleep asserts a
+    scheduling outcome rather than the behaviour under test -- and fails only when the
+    whole suite runs at once, which is the least useful time for a test to fail. Waiting
+    on the condition keeps the assertion about the latch and not about the machine.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"timed out after {timeout}s waiting for {label or predicate}")
+
+
+async def settled(seconds: float = 0.12) -> None:
+    """Give the loops a few ticks to *not* do something, for negative assertions."""
+    await asyncio.sleep(seconds)
+
+
 async def test_a_latch_presses_on_the_rising_edge_and_releases_on_the_falling_one():
     session, capture, sink = build_latch(
         [{"id": "go", "when": "probe('lit') > 0.5", "hold": "w"}]
     )
     task = session.start()
-    await asyncio.sleep(0.12)
+    await settled()
     assert key_events(sink, "w") == [], "nothing lit, nothing held"
 
     capture.level = 255
-    await asyncio.sleep(0.12)
-    assert key_events(sink, "w") == [True], "should be down, and down exactly once"
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed once")
 
     capture.level = 0
-    await asyncio.sleep(0.12)
-    assert key_events(sink, "w") == [True, False], "should have let go"
+    await until(lambda: key_events(sink, "w") == [True, False], label="w released")
 
     await session.stop("done")
     await task
@@ -344,7 +363,8 @@ async def test_a_latch_holds_across_many_ticks_rather_than_retriggering():
     )
     capture.level = 255
     task = session.start()
-    await asyncio.sleep(0.4)
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
+    await settled(0.4)  # ~20 further ticks with the guard still true
     await session.stop("done")
     await task
     presses = key_events(sink, "w")
@@ -360,7 +380,7 @@ async def test_a_latch_is_released_when_the_run_stops():
     )
     capture.level = 255
     task = session.start()
-    await asyncio.sleep(0.15)
+    await until(lambda: session._latched, label="the latch to engage")
     await session.stop("done")
     await task
     keys, buttons = session.deps.executor.held()
@@ -380,17 +400,15 @@ async def test_release_when_creates_a_dead_band_that_stops_chatter():
     }])
     capture.level = 255
     task = session.start()
-    await asyncio.sleep(0.12)
-    assert key_events(sink, "w") == [True]
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
 
     # Squarely inside the dead band: neither guard is true, so the latch keeps its state.
     capture.level = 128
-    await asyncio.sleep(0.2)
+    await settled(0.25)
     assert key_events(sink, "w") == [True], "the dead band must not release"
 
     capture.level = 0
-    await asyncio.sleep(0.12)
-    assert key_events(sink, "w") == [True, False]
+    await until(lambda: key_events(sink, "w") == [True, False], label="w released")
     await session.stop("done")
     await task
 
@@ -401,13 +419,12 @@ async def test_min_hold_ms_keeps_a_press_down_through_a_brief_dip():
     }])
     capture.level = 255
     task = session.start()
-    await asyncio.sleep(0.1)
-    assert key_events(sink, "w") == [True]
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
+    pressed_at = time.monotonic()
     capture.level = 0
-    await asyncio.sleep(0.1)
-    assert key_events(sink, "w") == [True], "min_hold_ms should still be holding it"
-    await asyncio.sleep(0.3)
-    assert key_events(sink, "w") == [True, False]
+    await until(lambda: key_events(sink, "w") == [True, False], label="w released")
+    # The assertion is the floor on hold time, not the wall-clock schedule around it.
+    assert (time.monotonic() - pressed_at) >= 0.28, "released before min_hold_ms elapsed"
     await session.stop("done")
     await task
 
@@ -425,7 +442,11 @@ async def test_a_latch_does_not_survive_the_state_that_owns_it():
             "hold": {
                 "brief": "x", "autonomous": False,
                 "reflex": [{"id": "go", "when": "probe('lit') > 0.5", "hold": "w"}],
-                "transitions": [{"when": "elapsed() > 0.25", "to": "done"}],
+                # Guarded on the latch rather than on elapsed time. A time-based exit
+                # races the reflex loop's first tick -- under load the state can be left
+                # before the latch ever engages, and the test then fails for a reason
+                # that has nothing to do with what it is checking.
+                "transitions": [{"when": "latched('go')", "to": "done"}],
             },
             "done": {"brief": "y", "autonomous": False, "transitions": []},
         },
@@ -442,9 +463,9 @@ async def test_a_latch_does_not_survive_the_state_that_owns_it():
         target_period_s=0.05, reflex_hz=50.0,
     ))
     task = session.start()
-    await asyncio.sleep(0.5)
-    assert session.state_name == "done"
+    await until(lambda: session.state_name == "done", label="the state to be left")
     assert key_events(sink, "w") == [True, False], "the latch must not outlive its state"
+    assert not session._latched
     await session.stop("done")
     await task
 
@@ -462,7 +483,8 @@ async def test_the_hold_watchdog_does_not_yank_a_latched_key():
     session.deps.executor.max_hold_ms = 50  # far shorter than the test, to force the issue
     capture.level = 255
     task = session.start()
-    await asyncio.sleep(0.35)
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
+    await settled(0.3)  # many times max_hold_ms, and many watchdog passes
     assert key_events(sink, "w") == [True], "the watchdog released a supervised latch"
     assert session.deps.executor.held()[0] == ["w"]
     await session.stop("done")
@@ -482,7 +504,8 @@ async def test_status_reports_the_reflex_rate_it_achieved():
         [{"id": "go", "when": "probe('lit') > 0.5", "hold": "w"}], reflex_hz=40.0
     )
     task = session.start()
-    await asyncio.sleep(0.4)
+    await until(lambda: session._reflex_ticks > 8, label="the fast loop to get going")
+    await settled(0.3)
     snap = session.snapshot()
     await session.stop("done")
     await task
@@ -555,3 +578,123 @@ def test_held_and_latched_see_the_previous_tick():
     assert Guard("held('btn:l')").evaluate(context) is True
     assert Guard("held('q')").evaluate(context) is False
     assert Guard("latched('sprint')").evaluate(context) is True
+
+
+# -- what a live run exposed -----------------------------------------------------------
+
+
+def test_the_token_budget_covers_what_the_grammar_permits():
+    """These two numbers drifting apart truncates the reply, and only on the busy cycles.
+
+    Observed live: the grammar allowed 20 actions, max_tokens was a fixed 96, and a 1.7B
+    that used its full allowance produced `...;w:120;w` -- every action well formed except
+    the last, which had no payload. Unparseable, so the whole cycle was thrown away.
+    """
+    from voltage_input_mcp.llm.grammar import actuator_token_budget
+
+    budget = actuator_token_budget(max_actions=20, max_text_len=96, targets=["recover"])
+    assert budget > 96, "the old fixed ceiling was below what the grammar could emit"
+    # A 20-action burst of short actions is ~100 tokens of text plus the two reply fields.
+    assert budget >= 20 * 5
+    assert budget <= 1024, "a ceiling this high is a runaway, not a safety margin"
+
+    # Shrinking what the grammar permits must shrink the budget with it.
+    tight = actuator_token_budget(max_actions=4, max_text_len=0, targets=[])
+    assert tight < budget
+
+
+def test_a_chord_is_a_set():
+    """`k:shift+shift` is not 'shift, harder'. Observed live from a 1.7B, four times over."""
+    assert parse_burst("k:shift+shift+shift+shift", screen=SCREEN).render() == "k:shift"
+    # Order of first appearance survives, because the executor releases in reverse and a
+    # modifier has to outlive the key it modifies.
+    assert parse_burst("k:ctrl+shift+ctrl+t", screen=SCREEN).render() == "k:ctrl+shift+t"
+
+
+def test_region_probes_subsample_without_changing_what_they_mean():
+    """Full-resolution region probes cost 10+ ms, which is half a reflex tick each.
+
+    Subsampling is only legitimate because both measurements are ratios or averages: the
+    fraction of changed pixels and the mean colour both survive a regular sample. This
+    checks that claim rather than assuming it.
+    """
+    from voltage_input_mcp.capture.base import Frame
+    from voltage_input_mcp.capture.probes import ProbeEngine, _subsample
+    from voltage_input_mcp.models.playbook import ProbeSpec
+
+    rng = np.random.default_rng(7)
+    base = np.full((600, 900, 3), 40, dtype=np.uint8)
+    frame_a = Frame(pixels=base.copy())
+
+    # Change a quarter of the area by well over the per-pixel threshold.
+    moved = base.copy()
+    moved[:300, :450] = 220
+    frame_b = Frame(pixels=moved)
+
+    spec = ProbeSpec(id="d", type="region_diff",
+                     region={"x": 0, "y": 0, "w": 900, "h": 600})
+    engine = ProbeEngine(specs=[spec])
+    engine.evaluate(frame_a)
+    changed = engine.evaluate(frame_b)["d"]
+    assert 0.2 < changed < 0.3, f"a quarter of the region changed, probe said {changed}"
+
+    # And a mean colour over a large flat area is unaffected by sampling it.
+    tinted = np.zeros((600, 900, 3), dtype=np.uint8)
+    tinted[:, :] = (200, 60, 60)
+    tinted += rng.integers(0, 6, tinted.shape, dtype=np.uint8)  # a little noise
+    mean_spec = ProbeSpec(id="m", type="region_mean", expect="#c83c3c", tolerance=12,
+                          region={"x": 0, "y": 0, "w": 900, "h": 600})
+    assert ProbeEngine(specs=[mean_spec]).evaluate(Frame(pixels=tinted))["m"] == 1.0
+
+    # Small regions -- every HUD element and progress bar -- are not sampled at all.
+    small = np.zeros((20, 8, 3), dtype=np.uint8)
+    assert _subsample(small) is small
+
+
+def test_diagnose_survives_a_burst_that_never_reached_the_governor():
+    """`allowed: false` with no violations meant an IndexError on the top refusal rule.
+
+    That crashed diagnose on exactly the runs most in need of it -- the ones where the
+    actuator was emitting something malformed.
+    """
+    from voltage_input_mcp.diagnose import diagnose
+
+    journal = [
+        {"kind": "cycle", "cycle": i, "t": i * 0.5, "state": "s",
+         "burst": "k:a;w:120;w:120;w:120;w:120;w", "allowed": False, "violations": [],
+         "error": "unparseable burst"}
+        for i in range(1, 6)
+    ]
+    report = diagnose(journal, None, status="failed", reason="x")
+    codes = {f["code"] for f in report["findings"]}
+    assert "unparseable_burst" in codes
+    finding = next(f for f in report["findings"] if f["code"] == "unparseable_burst")
+    assert finding["evidence"]["truncated"] == 5, "a trailing bare verb is a cut-off reply"
+
+
+def test_diagnose_separates_a_policy_refusal_from_a_malformed_burst():
+    from voltage_input_mcp.diagnose import diagnose
+
+    journal = [
+        {"kind": "cycle", "cycle": 1, "t": 0.0, "state": "s", "burst": "k:ctrl+alt+delete",
+         "allowed": False, "violations": [{"rule": "deny_chords"}]},
+        {"kind": "cycle", "cycle": 2, "t": 0.5, "state": "s", "burst": "k:a;w",
+         "allowed": False, "violations": []},
+    ]
+    codes = {f["code"] for f in diagnose(journal, None)["findings"]}
+    assert {"governor_refusals", "unparseable_burst"} <= codes
+
+
+def test_diagnose_names_a_burst_that_is_one_action_padded_out():
+    from voltage_input_mcp.diagnose import diagnose
+
+    padded = "k:space;" + ";".join(["w:120"] * 15)
+    journal = [
+        {"kind": "cycle", "cycle": i, "t": i * 0.5, "state": "s", "burst": padded,
+         "allowed": True, "executed": True, "probes": {"__frame_delta__": 0.4}}
+        for i in range(1, 6)
+    ]
+    finding = next(
+        f for f in diagnose(journal, None)["findings"] if f["code"] == "repetitive_bursts"
+    )
+    assert "max_actions_per_burst" in finding["fix"]

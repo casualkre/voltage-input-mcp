@@ -153,22 +153,57 @@ def diagnose(
         ))
 
     # -- 4. governor refusals ----------------------------------------------------------
-    if refused:
-        rules = Counter(
-            v.get("rule", "?") for c in refused for v in (c.get("violations") or [])
-        )
-        top, count = rules.most_common(1)[0]
+    # A cycle can be `allowed: false` with no violations: the burst never reached the
+    # governor because it did not parse. Those two have opposite fixes -- one is a policy
+    # disagreement, the other is the actuator emitting something malformed -- so they are
+    # separated here rather than being counted together and reported as whichever came
+    # first. Reading the top rule off an empty Counter used to raise IndexError, which
+    # meant diagnose crashed on precisely the runs most in need of it.
+    rules = Counter(
+        v.get("rule", "?") for c in refused for v in (c.get("violations") or [])
+    )
+    if rules:
+        top, _ = rules.most_common(1)[0]
+        by_rule = len([c for c in refused if c.get("violations")])
         findings.append(Finding(
-            "problem" if len(refused) < n * 0.3 else "blocker",
+            "problem" if by_rule < n * 0.3 else "blocker",
             "governor_refusals",
-            f"{len(refused)} of {n} bursts were refused; most often by `{top}`.",
+            f"{by_rule} of {n} bursts were refused; most often by `{top}`.",
             "The policy and what the actuator wants to do disagree. Refusal is "
             "whole-burst, so each one costs an entire cycle.",
             _refusal_fix(top),
-            {"refused": len(refused), "by_rule": dict(rules)},
+            {"refused": by_rule, "by_rule": dict(rules)},
         ))
 
-    # -- 5. the actuator is not chaining ----------------------------------------------
+    unparseable = [c for c in refused if not c.get("violations")]
+    if unparseable:
+        sample = next((str(c.get("burst", "")) for c in unparseable if c.get("burst")), "")
+        truncated = [c for c in unparseable if _looks_truncated(str(c.get("burst", "")))]
+        findings.append(Finding(
+            "blocker" if len(unparseable) > n * 0.3 else "problem",
+            "unparseable_burst",
+            f"{len(unparseable)} of {n} bursts could not be parsed at all.",
+            "These never reached the governor -- the actuator produced something that is "
+            "not a burst. Under llama.cpp a GBNF grammar makes that structurally "
+            + ("impossible mid-string, so the usual cause is the reply being cut off at "
+               "max_tokens with an action half-written."
+               if truncated else
+               "impossible, so this points at a backend running without one -- Ollama can "
+               "only constrain to a JSON schema, leaving the burst string itself free."),
+            (
+                "The reply hit the token limit. That almost always means the actuator is "
+                "repeating itself -- a run of identical actions padding out the burst. "
+                "Shorten what it is asked for: lower policy.max_actions_per_burst so the "
+                "grammar itself stops it, and put a concrete short burst in the state's "
+                "`hint` for it to copy."
+                if truncated else
+                "Check voltage_doctor: on llama.cpp this should not happen. If you are on "
+                "Ollama, expect it occasionally and keep max_actions_per_burst low."
+            ),
+            {"count": len(unparseable), "truncated": len(truncated), "first": sample[:120]},
+        ))
+
+    # -- 5. the actuator is not chaining, or is chaining the same thing over and over ---
     burst_lengths = [
         len([p for p in str(c.get("burst", "")).split(";") if p.strip()])
         for c in cycles if c.get("burst") and c.get("burst") != "."
@@ -184,6 +219,27 @@ def diagnose(
             "burst.' Give an explicit example. Small models copy the shape of an "
             "example far more reliably than they follow an abstract instruction.",
             {"mean_actions": round(sum(burst_lengths) / len(burst_lengths), 2)},
+        ))
+
+    repetitive = [
+        c for c in cycles
+        if c.get("burst") and _repetition_ratio(str(c["burst"])) >= 0.6
+    ]
+    if repetitive and len(repetitive) >= max(2, n * 0.25):
+        sample = str(repetitive[0].get("burst", ""))
+        findings.append(Finding(
+            "problem", "repetitive_bursts",
+            f"{len(repetitive)} of {n} bursts were mostly one action repeated.",
+            "A small model with a grammar that permits a long burst and a brief that does "
+            "not tell it when to stop will pad: the same action over and over until it "
+            "runs out of tokens. Every one of those tokens is decode time -- at ~22 ms a "
+            "token, a padded burst can cost more than a second of pure waste per cycle.",
+            "Cap it structurally rather than asking nicely. Lower "
+            "policy.max_actions_per_burst to the length the task actually needs; the "
+            "grammar is generated from it, so a longer burst becomes unrepresentable. "
+            "Then put one concrete example burst in the state's `hint` -- small models "
+            "copy a shape far more reliably than they follow an instruction.",
+            {"count": len(repetitive), "example": sample[:120]},
         ))
 
     # -- 6. a state that never left ----------------------------------------------------
@@ -444,6 +500,30 @@ def _diagnose_fast_layer(
         ))
 
     return findings
+
+
+def _looks_truncated(burst: str) -> bool:
+    """A burst whose last action is cut off mid-write.
+
+    `k:ctrl+t;w:120;w` is what a reply that hit max_tokens looks like: every action well
+    formed except the final one, which has no payload. Distinguishing it from genuinely
+    malformed output matters because the fix is completely different -- one is a token
+    budget, the other is a missing grammar.
+    """
+    tail = burst.rsplit(";", 1)[-1].strip()
+    return bool(tail) and (":" not in tail or not tail.split(":", 1)[1].strip())
+
+
+def _repetition_ratio(burst: str) -> float:
+    """Fraction of a burst taken up by its single most common action.
+
+    1.0 means every action is identical. Anything above ~0.6 in a burst of real length is
+    padding rather than a plan -- a genuine sequence varies.
+    """
+    actions = [p.strip() for p in burst.split(";") if p.strip()]
+    if len(actions) < 4:
+        return 0.0
+    return Counter(actions).most_common(1)[0][1] / len(actions)
 
 
 def _refusal_fix(rule: str) -> str:

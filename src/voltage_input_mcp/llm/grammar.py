@@ -157,6 +157,47 @@ def actuator_grammar(
     )
 
 
+def actuator_token_budget(
+    *,
+    max_actions: int,
+    max_text_len: int,
+    targets: Sequence[str] = (),
+    note_len: int = 12,
+) -> int:
+    """How many tokens the actuator must be allowed, given what the grammar permits.
+
+    These two numbers have to be derived from one source or they drift apart, and when
+    they do the failure is silent and total: the grammar happily generates a 20-action
+    burst, the sampler stops at the token limit part-way through action 17, and the reply
+    arrives with a half-written action on the end. That does not parse, so the whole cycle
+    is wasted -- and it only happens on the cycles where the model had the most to say.
+
+    Capping tokens is also not a way to make the actuator faster. Under a grammar, output
+    length is set by the grammar; a lower ceiling does not produce a shorter burst, it
+    produces a broken one. To get shorter output, lower `max_actions_per_burst` (which
+    regenerates the grammar) or `note_len`.
+
+    Deliberately generous. `max_tokens` is only a ceiling -- a model that stops earlier
+    costs nothing -- so the only real error is being too small.
+    """
+    longest_target = max((len(t) for t in targets), default=1)
+    return min(
+        1024,
+        max(
+            64,
+            # ~7 tokens for a worst-case action like `k:ctrl+shift+t` plus its separator.
+            max_actions * 7
+            # Typed text is the one unbounded payload; roughly 3 characters per token.
+            + max_text_len // 2
+            + longest_target // 2
+            + note_len // 2
+            # Separators, the reply's two '|' fields, and slack for a tokeniser that
+            # splits punctuation more finely than assumed.
+            + 24,
+        ),
+    )
+
+
 def _burst_rules(
     *,
     allow_verbs: Sequence[str],

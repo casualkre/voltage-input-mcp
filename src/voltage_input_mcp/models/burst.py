@@ -417,7 +417,17 @@ def parse_burst(
         payload = payload.strip()
 
         if verb == "k":
-            keys = tuple(_key_name(k) for k in payload.split("+") if k.strip())
+            # A chord is a set: `k:shift+shift` is not "shift, harder", it is `k:shift`
+            # with two tokens wasted. Small models do produce this -- observed live from a
+            # 1.7B as `k:shift+shift+shift+shift` -- and executing it verbatim means a
+            # redundant press and a redundant release around the real one. Deduplicating
+            # in first-seen order keeps modifier ordering, which the executor relies on to
+            # release in reverse.
+            seen_keys: dict[str, None] = {}
+            for part in payload.split("+"):
+                if part.strip():
+                    seen_keys.setdefault(_key_name(part), None)
+            keys = tuple(seen_keys)
             if not keys:
                 raise BurstParseError("empty key chord", source=src)
             if len(keys) > 5:

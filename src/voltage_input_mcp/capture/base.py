@@ -35,6 +35,9 @@ __all__ = ["CaptureBackend", "Frame", "downscale", "encode_png"]
 
 BackendName = Literal["kwin", "portal", "grim", "x11", "stub"]
 
+# Rec. 601 luma weights, as float32 so the dot below stays in single precision.
+_LUMA_WEIGHTS = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+
 
 @dataclass(slots=True)
 class Frame:
@@ -91,13 +94,13 @@ class Frame:
         return encode_png(pixels, compress_level=quality)
 
     def luma(self) -> np.ndarray:
-        """Rec. 601 luma as float32. Used by the diff and brightness probes."""
-        p = self.pixels
-        return (
-            0.299 * p[:, :, 0].astype(np.float32)
-            + 0.587 * p[:, :, 1].astype(np.float32)
-            + 0.114 * p[:, :, 2].astype(np.float32)
-        )
+        """Rec. 601 luma as float32.
+
+        A single float32 matmul rather than three weighted channel adds: numpy hands the
+        dot to BLAS, and it measures about eight times faster than either the three-term
+        form or `.mean(axis=2)`, which is not luma anyway.
+        """
+        return self.pixels.astype(np.float32) @ _LUMA_WEIGHTS
 
 
 def downscale(pixels: np.ndarray, target: tuple[int, int]) -> np.ndarray:
@@ -164,15 +167,36 @@ class CaptureBackend(abc.ABC):
         return self.grab().size
 
     def health(self) -> dict[str, object]:
+        """Report readiness and the *steady-state* cost of a frame.
+
+        The first grab on a streaming backend pays for the whole session -- the portal
+        dialog, the PipeWire negotiation, the first buffer -- which on a working setup is
+        a couple of hundred milliseconds and on the second grab is about two. Timing the
+        cold one and calling it the frame cost makes a streaming backend look ten times
+        worse than a per-call one, and the number is then used to decide what reflex rate
+        is sustainable. So warm up first, then measure, and report both.
+        """
         try:
             t0 = time.perf_counter()
             frame = self.grab()
-            dt = (time.perf_counter() - t0) * 1000.0
+            cold_ms = (time.perf_counter() - t0) * 1000.0
+
+            samples: list[float] = []
+            for _ in range(3):
+                t1 = time.perf_counter()
+                frame = self.grab()
+                samples.append((time.perf_counter() - t1) * 1000.0)
+            warm_ms = sorted(samples)[len(samples) // 2]
+
             return {
                 "backend": self.name,
                 "ok": True,
                 "size": list(frame.size),
-                "latency_ms": round(dt, 1),
+                # Two decimals: a warm read from a streaming slot is well under a
+                # millisecond, and rounding that to 0.0 reads as "unknown" rather than
+                # "too fast to matter" everywhere it is displayed or divided by.
+                "latency_ms": round(warm_ms, 2),
+                "first_frame_ms": round(cold_ms, 1),
                 "streaming": self.streaming,
             }
         except Exception as exc:  # noqa: BLE001 - health checks report, never raise

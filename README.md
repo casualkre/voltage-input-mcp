@@ -34,6 +34,13 @@ Separate deciding from doing, and put the doing on the same machine as the keybo
   └───────────────────────────┬─────────────────────────────────────┘
                               │
   ┌───────────────────────────▼─────────────────────────────────────┐
+  │  Layer 3  —  the fast loop, ~20 Hz, no model at all             │
+  │  Probes measure the screen in microseconds. Reflexes react.     │
+  │  Latches hold a key down for exactly as long as a condition     │
+  │  lasts. Runs concurrently with layer 2, not inside it.          │
+  └───────────────────────────┬─────────────────────────────────────┘
+                              │
+  ┌───────────────────────────▼─────────────────────────────────────┐
   │  safety governor  →  /dev/uinput  →  the actual desktop         │
   └─────────────────────────────────────────────────────────────────┘
 ```
@@ -43,7 +50,7 @@ are never asked to be.
 
 ## Where the speed actually comes from
 
-Not from the small models being fast — a 3B VLM still costs ~300 ms. It comes from four
+Not from the small models being fast — a 3B VLM still costs ~300 ms. It comes from five
 things, in descending order of impact:
 
 **Bursts.** The actuator does not emit an input. It emits a *burst*: a timed programme of
@@ -56,12 +63,29 @@ g:0;c:l;w:150;t:"README.md";k:enter;w:80;k:ctrl+s
 That is one decision and seven inputs spanning ~400 ms, scheduled to the millisecond. A
 40-action burst still costs one decision. **Input rate is set by the burst, not the model.**
 
-**Reflexes.** Rules that fire off cheap screen probes — one pixel, one region average — in
-microseconds, between decisions, with no model at all.
+**Reflexes.** Rules that fire off cheap screen probes — one pixel, one region average, a
+number OCR'd off the HUD — in microseconds, in their own loop at ~20 Hz, with no model at
+all.
 
 ```json
 {"id": "heal", "when": "probe('health') < 0.25", "do": "k:q;w:60", "cooldown_ms": 800}
 ```
+
+**Latches.** A burst is bounded; a latch is not. `hold` presses on the rising edge of a
+guard and releases on the falling one, so a key stays down for exactly as long as the
+condition lasts — across frames, across decisions.
+
+```json
+{"id": "glide", "when": "probe('meters') > 50",
+ "release_when": "probe('meters') < 25", "hold": "w, shift"}
+```
+
+This is the difference between reacting and controlling. The same behaviour written as a
+repeated one-shot is a stutter of taps at 20 Hz, which downstream is not a held key at all.
+
+Playbook-authored bursts may also contain `{expression}` holes, so the size of an action
+can depend on the size of the error — `r:{clamp((probe('mph') - 60) * 4, -220, 220)},0` is
+a proportional controller in one line, running at reflex rate.
 
 **Skipping perception.** Most cycles look at a screen that has not changed. A 40 µs
 frame-diff decides whether to spend 300 ms on the vision model or reuse the last
@@ -625,34 +649,42 @@ session. Three starter templates (games, desktop, minimal) are offered in the co
 | `voltage_observe` | One vision pass — check a `watch` list works before relying on it |
 | `voltage_validate_playbook` | Full static check: guards, bursts, graph, dead transitions |
 | `voltage_run` | Start a run; returns a `run_id` |
-| `voltage_status` | State, vars, last burst, what was seen, per-stage timings |
+| `voltage_status` | State, vars, last burst, what was seen, per-stage timings, reflex rate |
 | `voltage_steer` | Correct a live run — hint, variables, forced state, dry_run |
 | `voltage_stop` / `voltage_pause` | Stop or pause; stop always releases held input |
 | `voltage_journal` | Cycle-by-cycle record; `only_refused` to see policy conflicts |
+| `voltage_diagnose` | Journal → named failure modes and the edit that fixes each |
+| `voltage_lessons` / `voltage_learn` | Read and record what a target taught you |
 | `voltage_execute_burst` | Drive the input yourself, bypassing the local models |
 | `voltage_calibrate` | Verify injection reaches the compositor |
 
+`voltage_reference(section='control')` is the one to read before driving anything with
+timing in it — probes, latched holds and interpolated bursts, i.e. the layer that runs
+between decisions. A Playbook that declares none of it runs entirely at decision rate, and
+`voltage_run` says so in its `advice` field rather than letting you find out afterwards.
+
 ## Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — how the loop works, why each choice was made,
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the two loops work, why each choice was made,
   where the time goes
 - [PLAYBOOK.md](PLAYBOOK.md) — the authoring guide
+- [examples/air_control.json](examples/air_control.json) — continuous control end to end:
+  number probes, latches with hysteresis, a proportional steer
 
 ## Status
 
-Built and verified as far as it can be without weights on disk. 149 tests cover the burst
-DSL, the guard sandbox, the safety governor, playbook compilation, GBNF generation, the
-uinput wire encoding, and the run loop itself (driven with stub models — including a check
-that `on_change` perception really does skip the vision model on a static screen).
+255 tests cover the burst DSL, the guard sandbox, the safety governor, playbook
+compilation, GBNF generation, the uinput wire encoding, burst templates, and both loops
+driven with stub models and a stub screen — including that a latch presses once and
+releases once across a second of ticks rather than stuttering, that `on_change` perception
+measures against the frame vision actually saw, and that a stop never leaves input held.
 
-The MCP server was driven end-to-end over stdio by a real client: 13 tools, correct
-schemas, `execute_burst` accepted a valid burst and refused `sudo rm -rf /` with both
-matching rules.
+The MCP server has been driven end-to-end over stdio by a real client, and input injection
+has been verified against a live game: uinput events reach a Roblox client through its
+anti-cheat, and the executor's drag interpolation is what made drags register at all.
 
-What has **not** run is a live model: that needs llama.cpp built and weights fetched,
-which `scripts/` sets up. Two things were also deliberately not triggered during the
-build — the portal permission dialog, and any real input injection — since both act on
-your desktop.
+What is **not** covered by the test suite is a live model, which needs llama.cpp built and
+weights fetched — `scripts/` sets that up.
 
 Order of operations from here:
 

@@ -29,6 +29,12 @@ def _print(data: Any) -> None:
 # -- commands ------------------------------------------------------------------------------
 
 
+def _wrapped(text: str, width: int) -> list[str]:
+    import textwrap
+
+    return textwrap.wrap(" ".join(str(text).split()), width) or [""]
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     from .app import get_app
 
@@ -52,7 +58,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
     cap = report["capture"]
     health = cap.get("health", {})
-    latency = f"{health['latency_ms']}ms" if health.get("latency_ms") else ""
+    # `is not None`, not truthiness: a warm streaming grab measures 0.03 ms and rounds
+    # near zero, which is the best possible result and must not read as "not measured".
+    latency = (
+        f"{health['latency_ms']}ms/frame" if health.get("latency_ms") is not None else ""
+    )
+    if health.get("first_frame_ms"):
+        latency += f" (first {health['first_frame_ms']:.0f}ms)"
     available = [k for k, v in cap["available"].items() if v]
     print(
         f"  capture      {cap.get('selected', '-')} "
@@ -61,6 +73,18 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     if health.get("note"):
         print(f"               {health['note']}")
+    if cap.get("reflex_hz"):
+        sustainable = cap.get("sustainable_hz")
+        stream = "streaming" if cap.get("streaming") else "per-call grab"
+        print(
+            f"  fast loop    {cap['reflex_hz']:g} Hz requested  ({stream}"
+            + (f", ~{sustainable:g} Hz sustainable)" if sustainable else ")")
+        )
+        if cap.get("reflex_note"):
+            for line in _wrapped(cap["reflex_note"], 62):
+                print(f"               {line}")
+    else:
+        print("  fast loop    off -- reflexes fold back into the decision cycle")
     print(f"  ocr          {'ok' if cap.get('ocr') else 'FAIL -- number probes disabled'}")
     if cap.get("ocr_detail"):
         print(f"               {cap['ocr_detail']}")

@@ -48,7 +48,7 @@ from ..expr import GuardContext
 from ..inputs import DeviceSet, ExecutionReport, Executor
 from ..inputs.executor import PointerMode
 from ..llm import Backend, actuator_grammar, observation_grammar
-from ..llm.grammar import vision_vocabulary
+from ..llm.grammar import actuator_token_budget, vision_vocabulary
 from ..llm.ollama import BURST_SCHEMA, OBSERVATION_SCHEMA
 from ..models.burst import Burst, parse_burst
 from ..models.observation import CoordinateMapper, Observation, parse_vision_output
@@ -77,6 +77,9 @@ class SessionOptions:
     keep_frames: bool = False
     settle_ms: int = 60                  # pause after a burst before looking again
     vision_max_tokens: int = 192
+    # A floor, not a ceiling. The real limit is derived from what the grammar permits --
+    # see llm.grammar.actuator_token_budget -- because a ceiling below that does not make
+    # the burst shorter, it makes it truncated and unparseable.
     actuator_max_tokens: int = 96
     vision_timeout_s: float = 15.0
     actuator_timeout_s: float = 12.0
@@ -796,6 +799,10 @@ class Session:
         centres = [e.center for e in observation.elements]
         targets = self._legal_targets(state)
 
+        policy = self.playbook.spec.policy
+        max_actions = min(policy.max_actions_per_burst, 20)
+        max_text_len = min(policy.max_text_len, 96)
+
         grammar = None
         schema = None
         if self.deps.actuator.supports_grammar:
@@ -805,15 +812,25 @@ class Session:
                 lambda: actuator_grammar(
                     allow_verbs=sorted(state.allow_verbs),
                     targets=targets,
-                    allow_keys=self.playbook.spec.policy.allow_keys,
-                    deny_keys=self.playbook.spec.policy.deny_keys,
-                    max_actions=min(self.playbook.spec.policy.max_actions_per_burst, 20),
-                    max_text_len=min(self.playbook.spec.policy.max_text_len, 96),
+                    allow_keys=policy.allow_keys,
+                    deny_keys=policy.deny_keys,
+                    max_actions=max_actions,
+                    max_text_len=max_text_len,
                     n_elements=len(centres),
                 ),
             )
         else:
             schema = BURST_SCHEMA
+
+        # Derived from the grammar rather than configured, so the two cannot disagree.
+        # A ceiling below what the grammar permits does not shorten the burst -- it cuts
+        # it off mid-action, and the whole cycle is then thrown away on a parse error.
+        max_tokens = max(
+            self.options.actuator_max_tokens,
+            actuator_token_budget(
+                max_actions=max_actions, max_text_len=max_text_len, targets=targets
+            ),
+        )
 
         prompt = actuator_prompt(
             state,
@@ -835,7 +852,7 @@ class Session:
             system=ACTUATOR_SYSTEM,
             grammar=grammar,
             schema=schema,
-            max_tokens=self.options.actuator_max_tokens,
+            max_tokens=max_tokens,
             temperature=self.options.actuator_temperature,
             timeout_s=self.options.actuator_timeout_s,
             stop=["\n\n"],

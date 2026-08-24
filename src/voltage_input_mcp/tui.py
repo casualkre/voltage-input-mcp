@@ -582,7 +582,8 @@ _EDITABLE: list[tuple[str, str, str]] = [
     ("engine", "llamacpp | ollama", "which backend serves the models"),
     ("profile", "lean | balanced | split | quality | ollama", "model pair"),
     ("dry_run", "true | false", "never inject input unless a run opts in"),
-    ("target_period_s", "0.05 - 30", "loop period; lower for games"),
+    ("target_period_s", "0.05 - 30", "decision period; how often the models are asked"),
+    ("reflex_hz", "0 - 120", "fast loop: probes, holds and reflexes, no model. 0 = off"),
     ("capture_backend", "auto | portal | kwin | grim | x11", "screen capture"),
     ("pointer_mode", "absolute | relative", "switch if calibrate shows no movement"),
     ("text_mode", "auto | keys | clipboard", "how text is typed"),
@@ -606,7 +607,7 @@ def screen_config(state: dict[str, object]) -> None:
             print(f"  {i:>2}. {key:<22} {bold(str(value)):<22} {dim(allowed)}")
             print(f"      {dim(why)}")
         print()
-        print("  [1-10] edit   [r] reset to defaults   [q] back")
+        print(f"  [1-{len(_EDITABLE)}] edit   [r] reset to defaults   [q] back")
 
         choice = ask("choice").lower()
         if choice in ("q", ""):

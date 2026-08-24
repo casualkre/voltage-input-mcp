@@ -1,0 +1,150 @@
+{
+  "name": "air_control",
+  "goal": "Launch off a height, control the fall, and land hard for damage score. The point of this example is the fast layer: everything that matters happens between decisions, driven by numbers read off the HUD.",
+  "initial": "climb",
+
+  "vars": { "jumps": 0, "best_meters": 0 },
+
+  "_comment_read_first": "This is the worked example for voltage_reference(section='control'). Written against Roblox Broken Bones IV at 1920x1080, but the shape is the point, not the game. Every region below is a guess about where a HUD sits: run voltage_capture, find the actual digits, and fix the coordinates before running this. A number probe pointed at empty screen returns 0.0 forever, and a guard cannot tell that apart from a HUD that genuinely reads zero.",
+
+  "_comment_policy": "allow_keys is an allowlist, so anything omitted is absent from the actuator's grammar and cannot be generated -- there is no 'esc' here, so the pause menu is unreachable by construction. pointer_mode is set per-run: the game locks the cursor, so absolute positioning fights its camera and mouse-look does not work at all. max_burst_ms is deliberately short; a burst that runs for half a second is half a second in which no reflex can reach the device.",
+  "policy": {
+    "dry_run": true,
+    "pointer_mode": "relative",
+    "allow_verbs": ["k", "d", "u", "c", "r", "w"],
+    "allow_keys": ["w", "a", "s", "d", "space", "shift", "r", "e"],
+    "max_actions_per_burst": 12,
+    "max_burst_ms": 350,
+    "max_inputs_per_second": 90,
+    "max_hold_ms": 3000,
+    "allow_held_keys": true,
+    "require_target_element": false
+  },
+
+  "budget": {
+    "max_cycles": 400,
+    "max_seconds": 300,
+    "max_rejections": 15,
+    "idle_abort_s": 20,
+    "deadman_s": 4
+  },
+
+  "_comment_perception": "Vision is starved on purpose. A 3B VLM at ~300 ms cannot see a fall in progress, so it runs every fifth cycle to answer slow questions only -- am I on the ground, is the shop open. Everything time-critical is a probe.",
+  "perception": {
+    "mode": "cadence",
+    "cadence": 5,
+    "max_elements": 2,
+    "read_text": false,
+    "downscale_to": [644, 364]
+  },
+
+  "_comment_probes": "Number probes are what turn a guard into a physics condition. Each is OCR'd on a background worker every ocr_interval_ms and read from cache in microseconds, so a reflex fires on a real figure at full rate without ever waiting for tesseract. Each also publishes a derivative: rate('meters') is descent speed, with no differencing in the playbook.",
+  "probes": [
+    {
+      "id": "meters",
+      "type": "number",
+      "region": { "x": 1642, "y": 96, "w": 190, "h": 44 },
+      "ocr_interval_ms": 90
+    },
+    {
+      "id": "mph",
+      "type": "number",
+      "region": { "x": 1642, "y": 148, "w": 190, "h": 44 },
+      "ocr_interval_ms": 90
+    },
+    {
+      "id": "money",
+      "type": "number",
+      "region": { "x": 40, "y": 40, "w": 300, "h": 48 },
+      "ocr_interval_ms": 500
+    },
+    {
+      "id": "motion",
+      "type": "region_diff",
+      "region": { "x": 460, "y": 200, "w": 1000, "h": 600 }
+    }
+  ],
+
+  "states": {
+    "climb": {
+      "brief": "Get to the highest platform you can reach. Run and jump toward it.",
+      "hint": "Chain movement: hold a direction, jump, keep holding. One burst per approach, not one keypress per cycle.",
+      "watch": ["platform", "ladder"],
+
+      "_comment_reflex": "A latch, not a tap. `hold` presses on the rising edge and releases on the falling one, so W is genuinely down for the whole approach. Written as a one-shot `do: d:w;w:100;u:w` this would be a stutter of taps at 20 Hz, which on screen is a character twitching in place.",
+      "reflex": [
+        {
+          "id": "run",
+          "when": "probe('motion') > 0.02 and probe('meters') < 20",
+          "release_when": "probe('meters') > 35",
+          "hold": "w, shift",
+          "min_hold_ms": 200
+        }
+      ],
+
+      "transitions": [
+        { "when": "probe('meters') > 60", "to": "fall", "inc": { "jumps": 1 },
+          "note": "airborne and high enough to steer" },
+        { "when": "cycles() > 40", "to": "@failure", "note": "never got any height" }
+      ]
+    },
+
+    "fall": {
+      "_comment": "autonomous:false -- the actuator is skipped entirely here. There is nothing for a 2 Hz decision to usefully say about a fall that lasts three seconds, and asking anyway would only produce stale bursts competing with the reflexes. This state is pure fast layer.",
+      "brief": "Falling. The fast layer flies this.",
+      "autonomous": false,
+      "watch": ["ground"],
+      "timeout_s": 20,
+      "on_timeout": "recover",
+
+      "reflex": [
+        {
+          "_comment": "Air brake. Low and falling fast. Exclusive so a decision made from a 300 ms-old frame cannot override a reaction made 20 ms ago -- though with autonomous:false there is no decision to override, which is the safer arrangement.",
+          "id": "brake",
+          "when": "probe('meters') < 90 and rate('meters') < -55",
+          "do": "k:space",
+          "cooldown_ms": 220,
+          "priority": 10
+        },
+        {
+          "_comment": "Proportional steer. The {expression} hole makes the correction match the error instead of being a constant, and clamp keeps it from overshooting off-screen -- an unclamped servo term is the standard way an interpolated burst produces a move the parser refuses.",
+          "id": "steer",
+          "when": "probe('mph') > 25 and probe('meters') > 40",
+          "do": "r:{clamp((probe('mph') - 60) * 4, -220, 220)},0",
+          "cooldown_ms": 70,
+          "priority": 5,
+          "exclusive": false
+        },
+        {
+          "_comment": "A second latch: lean forward for the whole descent. Note the dead band -- engages above 50 m, releases below 25 m. Without that gap the guard would flip at reflex rate every time the reading hovered on the threshold, which diagnose reports as latch_chatter.",
+          "id": "lean",
+          "when": "probe('meters') > 50",
+          "release_when": "probe('meters') < 25",
+          "hold": "w"
+        }
+      ],
+
+      "transitions": [
+        { "when": "probe('meters') < 6 and abs(rate('meters')) < 3", "to": "recover",
+          "note": "landed" }
+      ]
+    },
+
+    "recover": {
+      "brief": "On the ground. Press R to respawn and go again.",
+      "watch": ["respawn button", "shop"],
+      "on_enter": "w:600;k:r;w:900",
+      "max_cycles": 12,
+      "on_timeout": "climb",
+      "transitions": [
+        { "when": "probe('money') > 400000", "to": "@success",
+          "note": "target bankroll reached" },
+        { "when": "probe('meters') < 12 and cycles() > 3", "to": "climb" }
+      ]
+    }
+  },
+
+  "success_when": "probe('money') > 400000",
+
+  "notes": "Checklist before running this against anything real. 1) voltage_doctor -- the `ocr` line must say ok, or every number probe reads 0 and every threshold below is comparing against zero. 2) voltage_capture and fix all four probe regions. 3) Run with dry_run=true and read voltage_diagnose: the `reflex` block should show fires > 0, starved == 0, and measured_hz close to requested. If fires is 0, the finding `reflex_never_fired` lists the highest value each probe actually reached, which is usually enough to see that a threshold or a region is wrong. 4) Only then dry_run=false."
+}

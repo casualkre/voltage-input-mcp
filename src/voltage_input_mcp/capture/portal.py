@@ -17,8 +17,10 @@ running GLib main loop, which lives on a dedicated thread here.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -132,6 +134,11 @@ class PortalBackend(CaptureBackend):
         self._frame_id = 0
         self._first_frame = threading.Event()
         self._started = False
+        self._closing = False
+        # GStreamer delivers samples on its own thread, so the pipeline has to be torn
+        # down before the interpreter starts unloading modules under it. Without this the
+        # process dumps core on the way out of a command that had already succeeded.
+        atexit.register(self._shutdown)
 
     # -- lifecycle -------------------------------------------------------------------
 
@@ -139,9 +146,17 @@ class PortalBackend(CaptureBackend):
     def streaming(self) -> bool:
         return True
 
+    def _shutdown(self) -> None:
+        self._closing = True
+        try:
+            self.stop()
+        except Exception:  # noqa: BLE001 - nothing useful to do at exit
+            pass
+
     def start(self) -> None:
         if self._started:
             return
+        self._closing = False
         _MainLoopThread.get()  # ensure signal delivery before any portal call
         self._connect()
         node_id, origin = self._negotiate()
@@ -375,7 +390,17 @@ class PortalBackend(CaptureBackend):
             raise CaptureError("GStreamer refused to start the PipeWire pipeline")
 
     def _on_sample(self, sink) -> Any:
-        from gi.repository import Gst
+        # GStreamer keeps delivering samples on its own thread while CPython tears the
+        # interpreter down, at which point importing anything raises and the unhandled
+        # exception inside a C callback takes the process with it -- a core dump on the
+        # way out of a command that had already succeeded. Nothing here is worth doing
+        # during shutdown, so bail out on the first sign of it.
+        if self._closing or sys.meta_path is None:
+            return 0  # Gst.FlowReturn.OK, without needing the import to get there
+        try:
+            from gi.repository import Gst
+        except ImportError:
+            return 0
 
         sample = sink.emit("pull-sample")
         if sample is None:

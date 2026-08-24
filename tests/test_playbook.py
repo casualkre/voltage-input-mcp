@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from voltage_input_mcp.errors import PlaybookError
@@ -150,3 +153,28 @@ def test_defaults_are_restrictive():
     assert "delete" in policy.deny_keys
     assert any("delete" in label for label in policy.deny_labels)
     assert policy.max_inputs_per_second <= 60
+
+
+# -- shipped examples ------------------------------------------------------------------
+
+
+def _example_files() -> list[Path]:
+    root = Path(__file__).resolve().parent.parent / "examples"
+    return sorted(root.glob("*.json"))
+
+
+def test_there_are_examples_to_check():
+    """Guards against the glob silently matching nothing and the tests below passing."""
+    assert _example_files(), "no example playbooks found"
+
+
+@pytest.mark.parametrize("path", _example_files(), ids=lambda p: p.stem)
+def test_every_shipped_example_compiles_without_warnings(path: Path):
+    """An example that no longer compiles is worse than no example.
+
+    Warnings count as failures here for the same reason: every one of them names a
+    playbook that cannot do what it looks like it does -- a guard on a label outside
+    `watch`, a state nothing reaches, a run with no path to success.
+    """
+    compiled = playbook_from_dict(json.loads(path.read_text()))
+    assert not compiled.warnings, f"{path.name}: {compiled.warnings}"

@@ -240,6 +240,28 @@ class App:
             # actually opening a session -- see PortalBackend.health.
             if health.get("ok") and health.get("size"):
                 self._screen = self._screen or tuple(health["size"])
+            # Whether the backend streams decides what reflex rate is actually reachable.
+            # A per-call grab costs 15-40 ms, so asking for 20 Hz on one is asking to
+            # spend the machine on capture -- the loop declines and reports a lower
+            # measured rate, which is confusing unless you know why.
+            report["capture"]["reflex_hz"] = self.config.reflex_hz
+            if self.config.reflex_hz > 0 and health.get("ok"):
+                # The loop holds itself to a 50% duty cycle so capture cannot crowd out
+                # the two model servers, so the sustainable rate is half the raw one.
+                per_frame = float(health.get("latency_ms") or 0.0)
+                sustainable = min(500.0 / per_frame, 120.0) if per_frame > 0 else 120.0
+                report["capture"]["streaming"] = bool(health.get("streaming"))
+                report["capture"]["frame_ms"] = per_frame
+                report["capture"]["sustainable_hz"] = round(sustainable, 1)
+                if sustainable < self.config.reflex_hz * 0.6:
+                    report["capture"]["reflex_note"] = (
+                        f"capture costs {per_frame:.0f} ms per frame here, so the fast "
+                        f"loop can sustain about {sustainable:.0f} Hz, not the "
+                        f"{self.config.reflex_hz:g} Hz configured. Reflex timing will be "
+                        f"coarser than a playbook assumes -- lower reflex_hz to match, or "
+                        f"switch to the 'portal' backend, which streams and reads a frame "
+                        f"in well under a millisecond."
+                    )
         except VoltageError as exc:
             report["capture"]["error"] = exc.to_dict()
 

@@ -26,47 +26,55 @@ capable:
 The orchestrator does not participate in the loop. It writes a **Playbook**, starts the
 run, then polls. Intelligence is spent once, in advance, on the structure — not per input.
 
-## The loop
+## Two loops, not one
+
+The reflex loop and the decision loop run concurrently at different rates. That is the
+whole point: a decision loop cannot dodge, and it cannot hold a key down for exactly as
+long as a condition lasts. Only something running an order of magnitude faster can.
 
 ```
-                    ┌───────────────────────────────────────┐
-                    │  capture  (portal → PipeWire, ~2 ms)  │
-                    └────────────────┬──────────────────────┘
-                                     ▼
-                    ┌───────────────────────────────────────┐
-                    │  probes   (numpy, ~40 µs)             │
-                    │  pixel / region / diff / template     │
-                    └────────────────┬──────────────────────┘
-                                     ▼
-        ┌────────────────────────────────────────────────────────┐
-        │  did the screen change?  ──no──▶ reuse cached observation│
-        │            │ yes                                        │
-        │            ▼                                            │
-        │  vision model (~500 ms per element), GBNF-constrained   │
-        └────────────────────────────┬───────────────────────────┘
-                                     ▼
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  1. success_when / failure_when   (runtime, no model)            │
-   │  2. reflexes                      (runtime, no model)            │
-   │  3. transitions                   (runtime, no model)            │
-   │  4. actuator                      (~150-200 ms, GBNF-constrained)│
-   └────────────────────────────┬────────────────────────────────────┘
-                                ▼
-                    ┌───────────────────────────────────────┐
-                    │  safety governor  (~50 µs)            │
-                    │  refuse whole burst, or pass          │
-                    └────────────────┬──────────────────────┘
-                                     ▼
-                    ┌───────────────────────────────────────┐
-                    │  executor: N inputs, ms-precise       │
-                    │  → /dev/uinput → compositor           │
-                    └───────────────────────────────────────┘
+  REFLEX LOOP  ~20 Hz                      DECISION LOOP  ~2 Hz
+  no model in the path                     two small models
+  ───────────────────────────              ─────────────────────────────────
+  capture (portal stream, ~2 ms)  ────────▶ reads the latest sample
+        │                          shared   (no second capture)
+        ▼                           frame          │
+  probes (numpy, ~40 µs)          ────────▶        ▼
+  number probes read a cached     probes    did the screen change since
+  value; OCR runs on a worker               vision last looked?
+        │                                          │ yes
+        ▼                                          ▼
+  latches: press / release to               vision model, GBNF-constrained
+  match each `hold` guard                   (~500 ms per reported element)
+        │                                          │
+        ▼                                          ▼
+  one-shot reflexes, by priority        1. success_when / failure_when
+        │                               2. transitions
+        │                               3. actuator (~150–200 ms, GBNF)
+        │                                          │
+        └──────────────┬───────────────────────────┘
+                       ▼
+          safety governor (~50 µs) — refuse the whole burst, or pass
+                       ▼
+          executor: N inputs, ms-precise → /dev/uinput → compositor
 ```
 
-Steps 1–3 run before step 4 deliberately. A reflex is a reaction that must not wait for a
-decision; a transition is the orchestrator's control flow and outranks anything the small
-model wants; the actuator only acts when the two faster, more trustworthy layers had
-nothing to say.
+Ordering inside the decision cycle is deliberate: outcome guards first, then transitions —
+the orchestrator's control flow, which outranks anything the small model wants — and the
+actuator only when neither had something to say. An `exclusive` reflex that fired since the
+last decision suppresses the next one, because letting a burst chosen from a 300 ms-old
+frame override a reaction made 20 ms ago is exactly backwards.
+
+Capture happens once, in the reflex loop. Sharing it is cheaper, but the reason it is
+*correct* is that `ProbeEngine` carries history — frame deltas, region diffs, number rates
+— and two loops advancing that history independently means every one of those measurements
+is taken across whatever interval happened to elapse between two unrelated callers.
+
+The executor serialises on one lock, so a reflex firing during a long actuator burst would
+queue behind it. It does not: reflexes pass a short acquisition timeout and are dropped,
+counted and diagnosed instead. A reaction delivered 400 ms late is not a late reaction, it
+is a reaction to a situation that has already resolved, applied to whatever is happening
+now.
 
 ## Where the latency actually goes
 
@@ -111,15 +119,41 @@ Nine inputs, one decision. A 40-action burst still costs one decision. This is u
 leverage and it is why the whole approach works at all — **input rate is decoupled from
 model rate.**
 
-**2. Reflexes.** Probe-driven rules with no model in the path:
+**2. Reflexes and latches.** Probe-driven rules with no model in the path, evaluated in
+their own loop at ~20 Hz. A one-shot reacts:
 
 ```json
 {"id": "dodge", "when": "probe('danger_flash') > 0.72",
  "do": "d:shift;k:s;w:120;u:shift", "cooldown_ms": 600, "priority": 5}
 ```
 
-Evaluated every frame in microseconds. This is how a 2 Hz decision loop produces
-sub-100 ms reactions.
+A latch *controls* — the keys go down on the rising edge and stay down until the guard
+goes false:
+
+```json
+{"id": "glide", "when": "probe('meters') > 50",
+ "release_when": "probe('meters') < 25", "hold": "w, shift"}
+```
+
+The distinction is not cosmetic. Continuous behaviour expressed as a repeated one-shot is a
+stutter of taps at reflex rate, which downstream is not a held key at all. `release_when`
+is a separate, wider falling threshold, so a dead band exists in which neither guard fires
+and the latch keeps its state — without it a guard sitting on its threshold flips 20 times
+a second.
+
+A Playbook-authored burst may also carry `{expression}` holes, evaluated at fire time
+against the live context:
+
+```json
+{"id": "steer", "when": "probe('mph') > 25",
+ "do": "r:{clamp((probe('mph') - 60) * 4, -220, 220)},0", "cooldown_ms": 70}
+```
+
+That makes the size of an action depend on the size of the error — a proportional
+controller running at reflex rate. The actuator's own bursts stay literal: the GBNF grammar
+is what makes a malformed or unsafe burst unrepresentable, and a model that could emit
+expressions would be a model that could emit expressions the grammar cannot bound. The
+orchestrator is trusted and its Playbook is validated up front; the 1.7B is neither.
 
 **3. Gating perception.** Most cycles look at a screen that has not moved. A 40 µs
 frame-diff decides whether to spend 300 ms on the VLM. On ordinary desktop work this skips
@@ -304,12 +338,13 @@ important cleanup path in the codebase, and it runs on abort, on crash, and on t
 ```
 models/burst.py         the burst DSL: parse, validate, resolve g: references
 models/observation.py   vision output → screen coordinates (CoordinateMapper)
+models/template.py      bursts with {expression} holes — proportional control
 models/playbook.py      the Playbook schema + compilation to executable form
 expr.py                 sandboxed guard expressions (allowlisted AST walk)
 
 capture/portal.py       ScreenCast → PipeWire → GStreamer (primary)
 capture/kwin.py         KWin ScreenShot2 (authorised binaries only)
-capture/probes.py       numpy pixel / region / diff / template probes
+capture/probes.py       numpy pixel / region / diff / template / OCR number probes
 
 inputs/uinput.py        ctypes virtual devices
 inputs/executor.py      burst scheduling, drift-free timing, clipboard text
@@ -322,10 +357,11 @@ llm/profiles.py         VRAM-budgeted model profiles
 safety/governor.py      every burst passes through here
 safety/killswitch.py    the four stops
 
-runtime/session.py      the loop
+runtime/session.py      both loops — decisions, and the reflex/latch loop under it
 runtime/prompts.py      cache-ordered prompt construction
 runtime/journal.py      the record the orchestrator reads back
 
-server.py               13 MCP tools
+diagnose.py             journal → named failure modes and the edit that fixes each
+server.py               MCP tools
 reference.py            self-describing DSL docs for the orchestrator
 ```

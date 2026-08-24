@@ -65,6 +65,10 @@ text_mode = "auto"
 # Absolute is correct for desktop UI. Switch to relative if `voltage_calibrate` shows the
 # cursor not moving -- that means libinput classified the virtual pointer in a way the
 # compositor ignores for absolute motion. Games with pointer lock generally want relative.
+#
+# This is the machine default. A playbook can override it for its own run with
+# policy.pointer_mode, which is usually what you want: a game needs relative and the
+# desktop needs absolute, and they should not require an edit and a restart between them.
 pointer_mode = "absolute"
 
 # Desktop geometry. Leave unset to detect it from a capture. Set as [width, height] only
@@ -78,9 +82,23 @@ pointer_mode = "absolute"
 # be tested first. Leaving this true means a mistake in a playbook is inert by default.
 dry_run = true
 
-# Target loop period in seconds. 0.5 (2 Hz) suits desktop work. Lower it for games; the
-# loop degrades gracefully rather than falling behind if a cycle overruns.
+# Target *decision* period in seconds -- how often the two models are asked. 0.5 (2 Hz)
+# suits desktop work. Lower it for games; the loop degrades gracefully rather than falling
+# behind if a cycle overruns.
 target_period_s = 0.5
+
+# Rate of the fast loop: capture, probes, latched holds and reflexes, with no model in the
+# path. This is a separate number from target_period_s on purpose -- it is the one that
+# decides whether a run can react to anything faster than a decision.
+#
+# A tick is ~2 ms on a streaming capture backend, so 20 Hz costs almost nothing. On a
+# backend that does a fresh grab per call (kwin, grim) a tick is 15-40 ms and the loop
+# stretches its own period rather than eating the machine the models need; `voltage_status`
+# then reports the rate it actually achieved, not the one requested.
+#
+# 0 disables the fast loop entirely and folds reflexes back into the decision cycle. That
+# is only sensible for pure desktop work where nothing needs to react between decisions.
+reflex_hz = 20.0
 
 # Pause after a burst before looking again, so the UI has caught up with what just
 # happened. Too low and the vision model reads a half-drawn frame.
