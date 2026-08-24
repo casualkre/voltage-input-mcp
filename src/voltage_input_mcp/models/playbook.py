@@ -53,6 +53,8 @@ __all__ = [
     "CompiledState",
     "CompiledReflex",
     "CompiledHold",
+    "Tunable",
+    "Reward",
     "compile_playbook",
     "TERMINALS",
 ]
@@ -247,6 +249,62 @@ class ReflexRule(BaseModel):
         return self
 
 
+class Tunable(BaseModel):
+    """A guard constant the episodic optimiser is allowed to move.
+
+    Every threshold in a reflex is a number somebody guessed. Declaring it here and
+    reading it with `tune('name')` lets the search find a better one against the reward
+    the game already prints on screen, at no inference cost -- the output is just a
+    better constant, and the guard stays one comparison.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    default: float = Field(description="starting value; used verbatim when tuning is off")
+    min: float = Field(description="lower bound; the search never proposes outside this")
+    max: float = Field(description="upper bound")
+
+    @model_validator(mode="after")
+    def _sane_bounds(self) -> Tunable:
+        if self.min >= self.max:
+            raise ValueError(f"min ({self.min}) must be below max ({self.max})")
+        if not self.min <= self.default <= self.max:
+            raise ValueError(
+                f"default {self.default} is outside [{self.min}, {self.max}]"
+            )
+        return self
+
+
+class Reward(BaseModel):
+    """How to score one episode, read off the screen.
+
+    Without this there is nothing to optimise against and the tuner is inert. `delta` is
+    the usual choice: a score, money or progress counter that only goes up, where what
+    matters is how much it moved during the episode.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    probe: str = Field(description="a number probe to score from")
+    mode: Literal["delta", "final", "rate"] = Field(
+        default="delta",
+        description=(
+            "delta: value at episode end minus value at start (a score counter). "
+            "final: the raw value at the end (a distance, a timer). "
+            "rate: delta divided by episode seconds (throughput, which is what you want "
+            "when a slower episode earning slightly more is actually worse)."
+        ),
+    )
+    settle_ms: int = Field(
+        default=1200, ge=0, le=20_000,
+        description=(
+            "wait this long after the episode ends before reading the final value. Score "
+            "counters animate, and reading one mid-tick scores the animation rather than "
+            "the result."
+        ),
+    )
+
+
 class Transition(BaseModel):
     """A guarded edge out of a state, evaluated by the runtime, not by a model."""
 
@@ -254,6 +312,14 @@ class Transition(BaseModel):
 
     when: str = Field(description="guard expression; the first true transition wins")
     to: str = Field(description="target state name, or @success / @failure / @stop")
+    ends_episode: bool = Field(
+        default=False,
+        description=(
+            "taking this edge closes the current episode: the reward is read, the "
+            "optimiser is told how the run's constants did, and the next episode starts "
+            "with whatever it proposes next."
+        ),
+    )
     set: dict[str, int | float | str | bool] = Field(
         default_factory=dict, description="variable assignments applied on the way out"
     )
@@ -515,6 +581,19 @@ class Playbook(BaseModel):
     states: dict[str, State] = Field(min_length=1, max_length=64)
     vars: dict[str, int | float | str | bool] = Field(default_factory=dict, max_length=32)
     probes: list[ProbeSpec] = Field(default_factory=list, max_length=24)
+    tunables: dict[Ident, Tunable] = Field(
+        default_factory=dict, max_length=16,
+        description=(
+            "guard constants the optimiser may move, read with tune('name'). Keep the "
+            "count low: the search gets a handful of episodes per minute, and every "
+            "extra dimension costs episodes that could have gone into the ones that "
+            "matter."
+        ),
+    )
+    reward: Reward | None = Field(
+        default=None,
+        description="how to score an episode; required for `tunables` to do anything",
+    )
     policy: Policy = Field(default_factory=Policy)
     budget: Budget = Field(default_factory=Budget)
     perception: Perception = Field(default_factory=Perception)
@@ -678,6 +757,19 @@ def _check_probes(guard: Guard, probe_ids: set[str], where: str, errors: list[st
         errors.append(f"{where} uses undefined probes {sorted(missing)}")
 
 
+def _check_tunables(
+    guard: Guard, tunable_ids: set[str], where: str, errors: list[str]
+) -> None:
+    missing = guard.referenced_tunables - tunable_ids
+    if missing:
+        errors.append(
+            f"{where} calls tune({sorted(missing)}) but those are not declared in "
+            f"`tunables`. An undeclared name silently falls back to its literal default "
+            f"and is never optimised, so the playbook would look like it is learning "
+            f"while nothing moves."
+        )
+
+
 def compile_playbook(spec: Playbook) -> CompiledPlaybook:
     """Fully validate a playbook: guards compile, bursts parse, graph is sound.
 
@@ -689,6 +781,7 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
 
     known_states = set(spec.states)
     probe_ids = {p.id for p in spec.probes}
+    tunable_ids = set(spec.tunables)
     base_verbs = frozenset(spec.policy.allow_verbs)
 
     success = _compile_guard(spec.success_when, "success_when", errors) if spec.success_when else None
@@ -725,6 +818,7 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                 errors.append(
                     f"{where}.transitions[{i}] uses undefined probes {sorted(missing_probes)}"
                 )
+            _check_tunables(guard, tunable_ids, f"{where}.transitions[{i}]", errors)
             transitions.append((guard, tr))
 
         reflexes: list[CompiledReflex] = []
@@ -751,8 +845,12 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                     continue
                 press, release_burst, names = parsed
                 _check_probes(guard, probe_ids, at, errors)
+                _check_tunables(guard, tunable_ids, at, errors)
                 if release_guard is not None:
                     _check_probes(release_guard, probe_ids, f"{at}.release_when", errors)
+                    _check_tunables(
+                        release_guard, tunable_ids, f"{at}.release_when", errors
+                    )
                 if rx.max_fires is not None:
                     warnings.append(
                         f"{at} is a hold, so `max_fires` counts how many times it may "
@@ -780,6 +878,7 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
             if template is None:
                 continue
             _check_probes(guard, probe_ids, at, errors)
+            _check_tunables(guard, tunable_ids, at, errors)
             missing = template.referenced_probes - probe_ids
             if missing:
                 errors.append(f"{at}.do interpolates undefined probes {sorted(missing)}")

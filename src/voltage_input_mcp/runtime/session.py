@@ -64,6 +64,7 @@ from ..models.template import BurstTemplate
 from ..safety import Governor, KillSwitch, Verdict
 from .journal import CycleRecord, Journal
 from .prompts import ACTUATOR_SYSTEM, VISION_SYSTEM, actuator_prompt, vision_prompt
+from .tuner import Tunable, Tuner
 
 __all__ = ["Session", "SessionOptions", "SessionDeps", "RunStatus"]
 
@@ -228,6 +229,23 @@ class Session:
         self._latch_events = 0
         self._sample: Sample | None = None
         self._sample_lock = threading.Lock()
+
+        # Episodic optimisation of guard constants. Inert unless the playbook declares
+        # both `tunables` and `reward` -- with neither, `tune()` still resolves to the
+        # declared defaults, so a guard written with tune() behaves identically whether
+        # the search is running or not and nothing has to be rewritten to turn it off.
+        self._tuner = Tuner(
+            [
+                Tunable(name=name, default=t.default, low=t.min, high=t.max)
+                for name, t in playbook.spec.tunables.items()
+            ],
+            explore=bool(playbook.spec.tunables and playbook.spec.reward),
+        )
+        self._tuner_loaded = self._tuner.load(playbook.spec.name)
+        self._tune_params: dict[str, float] = self._tuner.current()
+        self._episode_index = 0
+        self._episode_start_value = 0.0
+        self._episode_started_at = 0.0
         self._timings: dict[str, list[float]] = {"capture": [], "vision": [], "actuator": [],
                                                  "execute": [], "cycle": [], "reflex": []}
 
@@ -259,6 +277,15 @@ class Session:
             )
 
         try:
+            # Take one sample before the first episode so its reward baseline is a real
+            # reading rather than a zero that makes episode 1 score the whole counter.
+            await asyncio.to_thread(self._sample_fresh, 0.0)
+            self._begin_episode()
+            if self._tuner_loaded:
+                self.journal.event(
+                    "tuner_loaded", playbook=self.playbook.spec.name,
+                    best={k: round(v, 3) for k, v in self._tuner.best.items()},
+                )
             await self._enter_state(self.state_name, first=True)
             while True:
                 await self._pause.wait()
@@ -576,6 +603,14 @@ class Session:
         self._latched.clear()
         released = await asyncio.to_thread(self.deps.executor.release_all)
         self.deps.executor.pointer_mode = self._pointer_mode_was
+        if self._tuner.explore and self._tuner.episodes:
+            try:
+                saved = self._tuner.save(self.playbook.spec.name)
+                self.journal.event(
+                    "tuner_saved", path=str(saved), **self._tuner.summary()
+                )
+            except OSError as exc:  # noqa: BLE001 - never fail a run over a cache write
+                self.journal.event("tuner_save_failed", error=str(exc))
         self.killswitch.stop()
         self.probes.close()
         self.journal.event(
@@ -1022,9 +1057,65 @@ class Session:
             record.transition = transition.to
             if transition.note:
                 record.note = transition.note
+            if transition.ends_episode:
+                await self._close_episode(note=transition.note or transition.to)
             await self._goto(transition.to, state, record)
             return transition.to not in TERMINALS
         return None
+
+    # -- episodes --------------------------------------------------------------------
+
+    def _begin_episode(self) -> None:
+        """Snapshot the reward baseline and adopt the next set of constants to try."""
+        self._episode_index += 1
+        self._episode_started_at = time.monotonic()
+        spec = self.playbook.spec.reward
+        self._episode_start_value = (
+            float(self.probes.last.get(spec.probe, 0.0)) if spec else 0.0
+        )
+        self._tune_params = self._tuner.current()
+
+    async def _close_episode(self, *, note: str = "") -> None:
+        """Score the episode that just ended and hand the result to the optimiser.
+
+        The settle wait is not padding. Score counters animate -- money rolls up over a
+        second or so -- and reading one the instant the episode ends scores the animation
+        rather than the outcome, which teaches the optimiser noise.
+        """
+        spec = self.playbook.spec.reward
+        if spec is None:
+            return
+        if spec.settle_ms:
+            await asyncio.sleep(spec.settle_ms / 1000.0)
+            # Force a fresh sample so the settled value is actually read rather than
+            # taken from whatever the reflex loop last happened to store.
+            await asyncio.to_thread(self._sample_fresh, 0.0)
+
+        seconds = max(1e-3, time.monotonic() - self._episode_started_at)
+        final = float(self.probes.last.get(spec.probe, 0.0))
+        delta = final - self._episode_start_value
+        if spec.mode == "final":
+            reward = final
+        elif spec.mode == "rate":
+            reward = delta / seconds
+        else:
+            reward = delta
+
+        params = dict(self._tune_params)
+        self._tuner.record(reward, seconds=seconds, note=note)
+        self.journal.event(
+            "episode",
+            index=self._episode_index,
+            reward=round(reward, 3),
+            seconds=round(seconds, 2),
+            start=round(self._episode_start_value, 3),
+            final=round(final, 3),
+            params={k: round(v, 3) for k, v in params.items()},
+            best={k: round(v, 3) for k, v in self._tuner.best.items()},
+            sigma=self._tuner.summary()["sigma"],
+            note=note,
+        )
+        self._begin_episode()
 
     async def _goto(self, target: str, current: CompiledState, record: CycleRecord) -> None:
         # Latches go first, before on_exit and before the state changes. A hold is driven
@@ -1132,6 +1223,7 @@ class Session:
             vars=self.vars,
             held=self.deps.executor.held_names(),
             latched=set(self._latched),
+            tunables=self._tune_params,
             state={
                 "name": self.state_name,
                 "cycles": self._cycles_in_state,
@@ -1269,6 +1361,13 @@ class Session:
             "errors": dict(self._reflex_errors),
         }
 
+    def tuner_summary(self) -> dict[str, Any]:
+        out = self._tuner.summary()
+        out["loaded_from_disk"] = self._tuner_loaded
+        out["improvement"] = self._tuner.improvement()
+        out["live"] = {k: round(v, 3) for k, v in self._tune_params.items()}
+        return out
+
     def timing_summary(self) -> dict[str, dict[str, float]]:
         out: dict[str, dict[str, float]] = {}
         for name, samples in self._timings.items():
@@ -1296,6 +1395,7 @@ class Session:
             "cycles_in_state": self._cycles_in_state,
             "bursts": self._bursts,
             "reflex": self.reflex_summary(),
+            "tuner": self.tuner_summary(),
             "held": sorted(self.deps.executor.held_names()),
             "elapsed_s": round(elapsed, 1),
             "vars": dict(self.vars),

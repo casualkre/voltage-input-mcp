@@ -171,6 +171,20 @@ def _fn_rate(ctx: GuardContext, name: str, default: float = 0.0) -> float:
     return _fn_probe(ctx, f"{name}__rate", default)
 
 
+def _fn_tune(ctx: GuardContext, name: str, default: float = 0.0) -> float:
+    """A constant the optimiser is allowed to move.
+
+    Write `probe('meters') < tune('brake_at')` instead of `probe('meters') < 90` and the
+    90 stops being a guess you are stuck with. The runtime substitutes whatever the
+    episodic search currently believes is best, and the guard costs exactly what it cost
+    before -- a dict lookup and a comparison.
+    """
+    values = ctx.tunables
+    if name in values:
+        return float(values[name])
+    return float(default)
+
+
 def _fn_stale_reading(ctx: GuardContext, name: str, seconds: float = 1.0) -> bool:
     """True if this number probe has not produced a fresh value for `seconds`.
 
@@ -222,6 +236,7 @@ _CTX_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "probe": _fn_probe,
     "rate": _fn_rate,
     "stale_reading": _fn_stale_reading,
+    "tune": _fn_tune,
     "var": _fn_var,
     "held": _fn_held,
     "latched": _fn_latched,
@@ -278,6 +293,11 @@ class GuardContext:
     # rule cannot tell whether it already did the thing it is about to do again.
     held: set[str] = field(default_factory=set)
     latched: set[str] = field(default_factory=set)
+    # Constants the episodic optimiser is currently proposing. Read through `tune()`,
+    # which falls back to the literal default when a playbook declares no tunables at
+    # all -- so a guard written with tune() works identically with the search switched
+    # off, and nothing has to be rewritten to stop optimising.
+    tunables: dict[str, float] = field(default_factory=dict)
 
     def namespace(self, name: str) -> Mapping[str, Any]:
         if name == "obs":
@@ -448,6 +468,27 @@ class Guard:
                 name = node.args[0].value
                 probes.add(name.removesuffix("__rate").removesuffix("__age"))
         return probes
+
+    @property
+    def referenced_tunables(self) -> set[str]:
+        """Names passed to `tune()`, for cross-checking against the `tunables` block.
+
+        A `tune('brake_at')` whose name is not declared silently falls back to its
+        literal default and is never optimised -- so the playbook looks like it is
+        learning and is not. That is worth catching at compile time.
+        """
+        names: set[str] = set()
+        for node in ast.walk(ast.Expression(body=self._tree)):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "tune"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                names.add(node.args[0].value)
+        return names
 
     @property
     def referenced_numbers(self) -> set[str]:
