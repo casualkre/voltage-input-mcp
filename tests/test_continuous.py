@@ -698,3 +698,129 @@ def test_diagnose_names_a_burst_that_is_one_action_padded_out():
         f for f in diagnose(journal, None)["findings"] if f["code"] == "repetitive_bursts"
     )
     assert "max_actions_per_burst" in finding["fix"]
+
+
+# -- the stuck-key incident ------------------------------------------------------------
+
+
+def test_a_number_probe_reports_its_age_so_a_dead_reading_is_detectable():
+    """The whole failure hinges on this being observable.
+
+    A number probe whose region gets covered returns its last value forever rather than
+    failing, so the value alone cannot distinguish "steady" from "stopped arriving".
+    """
+    from voltage_input_mcp.capture.base import Frame
+    from voltage_input_mcp.capture.probes import ProbeEngine
+    from voltage_input_mcp.models.playbook import ProbeSpec
+
+    spec = ProbeSpec(id="hud", type="number", region={"x": 0, "y": 0, "w": 40, "h": 20})
+    engine = ProbeEngine(specs=[spec])
+    values = engine.evaluate(Frame(pixels=np.zeros((60, 60, 3), dtype=np.uint8)))
+    # Never resolved, so it reports as ancient rather than as zero-age.
+    assert values["hud__age"] > 1000
+    assert engine.number_age_s("hud") > 1000
+
+
+async def test_a_latch_releases_when_every_probe_its_guard_reads_goes_blind():
+    """The exact incident: guard on a HUD number, HUD gets covered, key never comes up.
+
+    The guard cannot detect this -- a dead number probe hands it a plausible stale value
+    -- so the runtime has to notice on the guard's behalf.
+    """
+    playbook = playbook_from_dict({
+        "name": "blind",
+        "goal": "hold against a reading that dies",
+        "initial": "run",
+        # A number probe over a region that will never OCR to anything, so it is stale
+        # from the first tick -- which is what a covered HUD looks like.
+        "probes": [
+            BRIGHT,
+            {"id": "hud", "type": "number", "region": {"x": 0, "y": 0, "w": 30, "h": 16}},
+        ],
+        "perception": {"mode": "never"},
+        "policy": {"dry_run": False, "allow_verbs": ["d", "u", "k", "w"],
+                   "allow_keys": ["w"], "max_latch_ms": 60000},
+        "budget": {"max_cycles": 500, "max_seconds": 20, "idle_abort_s": 0},
+        "states": {
+            "run": {
+                "brief": "x", "autonomous": False,
+                "reflex": [
+                    # Engages off a readable probe, releases off a dead one -- which is
+                    # precisely the shape that stuck.
+                    {"id": "stuck", "when": "probe('lit') > 0.5",
+                     "release_when": "rate('hud') < -9", "hold": "w"},
+                ],
+                "transitions": [],
+            }
+        },
+    })
+    capture = DialCapture(level=255)
+    sink = Sink()
+    deps = SessionDeps(
+        capture=capture, vision=Quiet(vision=True), actuator=Quiet(),
+        devices=DeviceSet(screen=SCREEN), executor=Executor(sink, dry_run=False),
+        screen=SCREEN,
+    )
+    session = Session(playbook, deps, SessionOptions(
+        settle_ms=0, watch_physical_input=False, dry_run=False,
+        target_period_s=0.05, reflex_hz=50.0,
+    ))
+    task = session.start()
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
+    # _BLIND_PROBE_S is 1.2 s; the release must happen without the guard ever going true.
+    await until(
+        lambda: key_events(sink, "w") == [True, False],
+        timeout=4.0, label="the blind latch to release itself",
+    )
+    assert not session._latched
+    await session.stop("done")
+    await task
+
+
+async def test_max_latch_ms_caps_a_hold_whose_guard_simply_never_lets_go():
+    """The last backstop, for a guard that is readable and just wrong.
+
+    The blind-probe check above only fires when a guard's inputs die. A guard whose
+    inputs are perfectly healthy and whose release condition is simply unsatisfiable
+    needs a ceiling, or the key stays down for the life of the run.
+    """
+    playbook = playbook_from_dict({
+        "name": "ceiling",
+        "goal": "hold with an unsatisfiable release",
+        "initial": "run",
+        "probes": [BRIGHT],
+        "perception": {"mode": "never"},
+        "policy": {"dry_run": False, "allow_verbs": ["d", "u", "k", "w"],
+                   "allow_keys": ["w"], "max_latch_ms": 400},
+        "budget": {"max_cycles": 500, "max_seconds": 20, "idle_abort_s": 0},
+        "states": {
+            "run": {
+                "brief": "x", "autonomous": False,
+                # Brightness is never negative, so this release can never be true.
+                "reflex": [{"id": "forever", "when": "probe('lit') > 0.5",
+                            "release_when": "probe('lit') < -1", "hold": "w"}],
+                "transitions": [],
+            }
+        },
+    })
+    capture = DialCapture(level=255)
+    sink = Sink()
+    deps = SessionDeps(
+        capture=capture, vision=Quiet(vision=True), actuator=Quiet(),
+        devices=DeviceSet(screen=SCREEN), executor=Executor(sink, dry_run=False),
+        screen=SCREEN,
+    )
+    session = Session(playbook, deps, SessionOptions(
+        settle_ms=0, watch_physical_input=False, dry_run=False,
+        target_period_s=0.05, reflex_hz=50.0,
+    ))
+    task = session.start()
+    await until(lambda: key_events(sink, "w") == [True], label="w pressed")
+    pressed_at = time.monotonic()
+    await until(
+        lambda: key_events(sink, "w") == [True, False],
+        timeout=5.0, label="the ceiling to force a release",
+    )
+    assert (time.monotonic() - pressed_at) < 2.0, "the 400 ms ceiling did not apply"
+    await session.stop("done")
+    await task

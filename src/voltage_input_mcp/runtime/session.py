@@ -105,6 +105,10 @@ _REFLEX_DUTY: Final = 0.5
 # its own. Generous, because the vision call it feeds takes an order of magnitude longer
 # than this.
 _SHARE_MAX_AGE_S: Final = 0.08
+# How long a number probe may go without producing a value before a latch depending on it
+# is treated as flying blind. Well above any sane `ocr_interval_ms`, low enough that a key
+# comes up within a second of the HUD disappearing rather than staying down indefinitely.
+_BLIND_PROBE_S: Final = 1.2
 
 
 @dataclass(slots=True)
@@ -412,7 +416,49 @@ class Session:
                 continue
 
             _, since = self._latched[rule.id]
-            if (time.monotonic() - since) * 1000.0 < rule.min_hold_ms:
+            held_ms = (time.monotonic() - since) * 1000.0
+
+            # Backstop 1: a latch cannot outlive its guard's ability to see.
+            #
+            # A number probe whose region gets covered -- by a modal, a scene change, a
+            # menu -- does not fail. It returns its last value, forever. So a guard like
+            # `release_when: rate('meters') < -9` stops being a measurement of anything
+            # and silently freezes at whatever it last read, and the key stays down. That
+            # is exactly how a hold on `w, shift` ended up typing capital Ws into a
+            # window that was not even the game.
+            #
+            # The guard cannot detect this; only the runtime can, by noticing that every
+            # number the guard reads has stopped arriving.
+            blind = hold.depends_on_numbers and all(
+                self.probes.number_age_s(pid) >= _BLIND_PROBE_S
+                for pid in hold.depends_on_numbers
+            )
+            if blind:
+                self.journal.event(
+                    "hold_blind", rule=rule.id, holding=list(hold.names),
+                    probes=sorted(hold.depends_on_numbers),
+                    detail="every number this guard reads has gone stale; releasing",
+                )
+                await self._disengage(hold)
+                continue
+
+            # Backstop 2: an absolute ceiling, whatever the guard says.
+            #
+            # Latched keys are exempt from the hold watchdog because a guard re-checked
+            # fifty times a second is stricter supervision than a timer. That is true
+            # while the guard is sound, and it is precisely the assumption that fails
+            # here -- so the exemption gets a ceiling rather than being unbounded.
+            if held_ms >= self.playbook.spec.policy.max_latch_ms:
+                self.journal.event(
+                    "hold_expired", rule=rule.id, holding=list(hold.names),
+                    held_ms=round(held_ms),
+                    detail=f"exceeded policy.max_latch_ms "
+                           f"({self.playbook.spec.policy.max_latch_ms}); releasing",
+                )
+                await self._disengage(hold)
+                continue
+
+            if held_ms < rule.min_hold_ms:
                 continue
             if hold.release is not None:
                 # An explicit release condition, so there is a dead band between the two

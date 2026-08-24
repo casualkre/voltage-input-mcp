@@ -171,6 +171,17 @@ def _fn_rate(ctx: GuardContext, name: str, default: float = 0.0) -> float:
     return _fn_probe(ctx, f"{name}__rate", default)
 
 
+def _fn_stale_reading(ctx: GuardContext, name: str, seconds: float = 1.0) -> bool:
+    """True if this number probe has not produced a fresh value for `seconds`.
+
+    A number probe returns its last reading forever once the thing it was reading is
+    covered up -- by a modal, a scene change, a menu. The value alone cannot distinguish
+    "genuinely steady" from "stopped arriving", and a guard that cannot tell the
+    difference will happily keep a key held against a measurement that died a minute ago.
+    """
+    return float(ctx.probes.get(f"{name}__age", 0.0)) >= seconds
+
+
 def _fn_held(ctx: GuardContext, name: str) -> bool:
     """True if the executor is currently holding this key or button (`btn:l` for mouse).
 
@@ -210,6 +221,7 @@ _CTX_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "flag": _fn_flag,
     "probe": _fn_probe,
     "rate": _fn_rate,
+    "stale_reading": _fn_stale_reading,
     "var": _fn_var,
     "held": _fn_held,
     "latched": _fn_latched,
@@ -428,14 +440,24 @@ class Guard:
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id in ("probe", "rate")
+                and node.func.id in ("probe", "rate", "stale_reading")
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
             ):
                 name = node.args[0].value
-                probes.add(name.removesuffix("__rate"))
+                probes.add(name.removesuffix("__rate").removesuffix("__age"))
         return probes
+
+    @property
+    def referenced_numbers(self) -> set[str]:
+        """Probe ids read through `probe`, `rate` or `stale_reading`.
+
+        The runtime uses this to work out which measurements a guard actually depends on,
+        so it can tell when every one of them has stopped arriving and the guard is
+        deciding from stale numbers without any way to notice.
+        """
+        return self.referenced_probes
 
     def evaluate(self, ctx: GuardContext) -> Any:
         return self._eval(self._tree, ctx)

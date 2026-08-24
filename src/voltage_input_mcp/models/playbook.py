@@ -401,6 +401,18 @@ class Policy(BaseModel):
             "twenty times a second is stricter supervision than a timer."
         ),
     )
+    max_latch_ms: int = Field(
+        default=12_000, ge=100, le=120_000,
+        description=(
+            "absolute ceiling on a single `hold`, regardless of what its guard says. "
+            "Latched keys are exempt from `max_hold_ms` because a guard re-checked at "
+            "reflex rate is stricter supervision than a timer -- but that is only true "
+            "while the guard can still see. A number probe whose region gets covered "
+            "returns its last value forever rather than failing, so a guard reading it "
+            "freezes without noticing and the key never comes up. This is the ceiling on "
+            "that. Raise it for a genuinely long hold; do not disable it."
+        ),
+    )
     pointer_mode: Literal["absolute", "relative"] | None = Field(
         default=None,
         description=(
@@ -562,6 +574,12 @@ class CompiledHold:
     press: Burst
     release_burst: Burst
     names: tuple[str, ...]
+    # Number probes the guards read. When every one of these has stopped producing
+    # values the guard is deciding from readings that died, and the latch has to let go
+    # on its own -- the guard cannot notice, because a dead number probe returns its last
+    # value rather than an error. This is the field that turns a stuck key into a
+    # released one.
+    depends_on_numbers: frozenset[str] = frozenset()
 
 
 class CompiledState:
@@ -741,6 +759,10 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                         f"*engage*, not how many inputs it sends; a latch that has spent "
                         f"its fires stops responding entirely"
                     )
+                number_ids = {p.id for p in spec.probes if p.type == "number"}
+                reads = set(guard.referenced_numbers)
+                if release_guard is not None:
+                    reads |= release_guard.referenced_numbers
                 holds.append(
                     CompiledHold(
                         rule=rx,
@@ -749,6 +771,7 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                         press=press,
                         release_burst=release_burst,
                         names=names,
+                        depends_on_numbers=frozenset(reads & number_ids),
                     )
                 )
                 continue

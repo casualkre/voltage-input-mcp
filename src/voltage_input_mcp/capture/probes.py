@@ -66,6 +66,10 @@ _PIXEL_CHANGE_THRESHOLD = 8.0
 # element and progress bar -- the cases where precision is actually wanted.
 _MAX_PROBE_PIXELS = 4096
 
+# Reported as the age of a number probe that has never resolved. Large enough that every
+# staleness comparison treats it as stale, finite so arithmetic on it stays well defined.
+_NEVER_READ_S = 1e6
+
 # Rec. 601 luma. Used as a float32 dot rather than `.mean(axis=2)`, which is both eight
 # times slower (float64 promotion of every channel) and not actually luma -- a flat channel
 # average treats blue as though the eye weighed it the same as green.
@@ -202,13 +206,31 @@ class ProbeEngine:
                 values[spec.id] = 0.0
 
         # Derivatives ride alongside, so `rate('meters')` is available without the
-        # playbook differencing anything itself.
+        # playbook differencing anything itself. So does age, which is what tells a
+        # reading that is genuinely steady apart from one that stopped arriving -- a
+        # number probe returns its last value forever once the thing it was reading is
+        # covered up, and no guard can tell those two apart from the value alone.
         with self._lock:
             for key, rate in self._rates.items():
                 values[f"{key}__rate"] = rate
+            for key, at in self._number_at.items():
+                values[f"{key}__age"] = now - at
+        for spec in self.specs:
+            if spec.type == "number" and f"{spec.id}__age" not in values:
+                values[f"{spec.id}__age"] = _NEVER_READ_S
 
         self._last_values = values
         return values
+
+    def number_age_s(self, probe_id: str) -> float:
+        """Seconds since this number probe last produced a value.
+
+        `_NEVER_READ_S` if it never has. Used by the runtime to decide that a guard has
+        gone blind, which is not something the guard itself can notice.
+        """
+        with self._lock:
+            at = self._number_at.get(probe_id)
+        return _NEVER_READ_S if at is None else time.monotonic() - at
 
     # -- individual probes -----------------------------------------------------------
 
