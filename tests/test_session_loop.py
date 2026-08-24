@@ -145,6 +145,35 @@ async def test_on_change_mode_skips_the_vision_model_on_a_static_screen():
     )
 
 
+async def test_reusing_one_sample_across_cycles_does_not_re_run_vision():
+    """The gate has to be answered live, not read out of the sample's probe snapshot.
+
+    One capture is shared by several decision cycles. The probe dict in it was computed
+    before the vision call that follows, so a cached `delta_vs_vision` still reads 1.0 on
+    every cycle that reuses the sample -- and `on_change` quietly degrades into `always`,
+    which is the single thing it exists to prevent. It only shows up when cycles are fast
+    enough to reuse a sample, which is why making an unrelated path faster exposed it.
+    """
+    playbook = {**BASIC, "perception": {"mode": "on_change", "change_threshold": 0.02}}
+    playbook["states"] = {
+        "find": {
+            "brief": "wait",
+            "watch": ["target"],
+            "transitions": [{"when": "run_cycles() >= 10", "to": "@success"}],
+        }
+    }
+    # Cycles far faster than _SHARE_MAX_AGE_S, so nearly every one reuses the sample.
+    session, capture, deps = build(
+        playbook, [VISION_SEES_TARGET], [".|.|idle"], target_period_s=0.001
+    )
+    await session.start()
+    assert session._cycle >= 10
+    assert deps.vision.calls <= 2, (
+        f"vision ran {deps.vision.calls} times across {session._cycle} cycles of an "
+        "unchanged screen; the on_change gate is reading a stale baseline"
+    )
+
+
 async def test_on_change_measures_against_the_frame_vision_last_saw():
     """The gate asks "has the screen moved since the VLM looked", not "since last frame".
 

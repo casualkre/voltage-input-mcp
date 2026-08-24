@@ -160,12 +160,26 @@ class ProbeEngine:
     def mark_perceived(self, frame: Frame) -> None:
         """Record that the vision model has just looked at this frame.
 
-        Sets the baseline `__delta_vs_vision__` measures against. Called by the session
+        Sets the baseline `delta_vs_vision` measures against. Called by the session
         immediately after a successful vision call, and only then -- a skipped or failed
         call must leave the old baseline in place, or the loop concludes the screen is
         unchanged relative to an observation it never made.
         """
         self._vision_thumb = _thumbnail_luma(frame.pixels)
+        if self._last_values:
+            self._last_values["__delta_vs_vision__"] = 0.0
+
+    def delta_vs_vision(self, frame: Frame) -> float:
+        """How much this frame differs from what the vision model last saw.
+
+        Recomputed on demand rather than read out of the probe dict, because that dict is
+        a snapshot from the moment of capture and the baseline moves *after* it. One
+        sample is shared across several decision cycles, so a cached answer meant every
+        cycle that reused a sample still saw the pre-vision value of 1.0 and ran the
+        vision model again -- `on_change` silently degrading into `always`, which is the
+        one thing it exists to prevent. Costs a thumbnail and a diff, about 100 us.
+        """
+        return _thumb_delta(_thumbnail_luma(frame.pixels), self._vision_thumb)
 
     def evaluate(self, frame: Frame) -> dict[str, float]:
         values: dict[str, float] = {}

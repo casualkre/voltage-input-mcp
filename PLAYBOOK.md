@@ -327,9 +327,19 @@ actuator wants to do disagree, and the Playbook needs rethinking rather than a b
 | `always` | the screen changes constantly and every frame matters |
 | `never` | probes and reflexes only; pure timing sequences |
 
-`downscale_to` is the dominant cost knob: 896×504 is ~400 image tokens; halving the
-dimensions roughly quarters prefill. Drop to `[640, 360]` for games. Per-state overrides
-are allowed — spend vision where it matters.
+`max_elements` is the dominant cost knob, at roughly 500 ms per reported element. Set it
+to the number your guards actually test for and no higher. Per-state overrides are
+allowed — spend vision where it matters.
+
+`downscale_to` is **not** a useful speed knob, despite looking like the obvious one. Both
+models are decode-bound at ~22 ms/token and prefill is ~28 ms across the whole size range,
+so a smaller image saves nothing — and it costs, because a blurrier image makes the model
+less certain and it emits *more* tokens. Measured: 448×252 came out 2.5× slower than
+896×504. Use the largest size that fits your VRAM.
+
+On a 16:9 display the sizes that land exactly on the model's 28-pixel token grid are the
+multiples of 448×252 — so `[896, 504]` and `[448, 252]`. Others come out a few pixels off
+it and the model resizes internally; grounding is unaffected either way.
 
 ---
 

@@ -281,3 +281,54 @@ def test_actuator_note_is_short_by_default():
     """The note is diagnostic only and cost 55% of actuator latency at 48 chars."""
     g = actuator_grammar(allow_verbs=["c"], targets=[], n_elements=1)
     assert "{0,12}" in [ln for ln in g.splitlines() if ln.startswith("note ::=")][0]
+
+
+# -- downscaling -----------------------------------------------------------------------
+
+
+def test_downscale_honours_the_size_it_was_asked_for():
+    """It used to reduce by an integer factor and return whatever that gave.
+
+    On a 1080p display that meant every request between 640 and 960 wide came back as
+    960x540 -- the documented cost knob doing nothing across the band anyone would tune
+    in, and `Perception.downscale_to`'s snapping to multiples of 28 discarded on the way
+    through.
+    """
+    import numpy as np
+
+    from voltage_input_mcp.capture.base import downscale
+
+    src = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    for want_w, want_h in [(896, 504), (644, 364), (560, 336), (448, 252)]:
+        out = downscale(src, (want_w, want_h))
+        got_h, got_w = out.shape[:2]
+        assert got_w == want_w, f"asked {want_w} wide, got {got_w}"
+        assert got_h <= want_h, "must fit inside the target, not exceed it"
+        # Aspect preserved, so the height follows the width rather than being padded.
+        assert abs(got_w / got_h - 1920 / 1080) < 0.01
+
+
+def test_downscale_leaves_an_already_small_image_alone():
+    import numpy as np
+
+    from voltage_input_mcp.capture.base import downscale
+
+    tiny = np.zeros((10, 10, 3), dtype=np.uint8)
+    assert downscale(tiny, (100, 100)) is tiny
+
+
+def test_downscale_box_filter_matches_an_exact_block_mean():
+    """BOX at an integer ratio is the block mean the numpy path used to compute.
+
+    Worth pinning: the numpy version was replaced on performance grounds (~103 ms versus
+    ~11 ms), so the claim that nothing was given up on quality should be checked rather
+    than asserted in a comment.
+    """
+    import numpy as np
+
+    from voltage_input_mcp.capture.base import downscale
+
+    src = np.random.default_rng(11).integers(0, 255, (400, 600, 3), dtype=np.uint8)
+    got = downscale(src, (300, 200)).astype(int)
+    expected = src.reshape(200, 2, 300, 2, 3).mean(axis=(1, 3)).astype(int)
+    assert np.abs(got - expected).max() <= 1

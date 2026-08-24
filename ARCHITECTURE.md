@@ -83,21 +83,29 @@ design is built around.
 
 | Step | Cost | Notes |
 |---|---|---|
-| capture (portal stream) | ~2 ms | reading the newest frame from a slot |
-| capture (per-call) | 15–60 ms | why streaming is preferred |
-| probes | ~40 µs | 160×90 luma thumbnail diff |
-| vision prefill | ~28 ms | flat from 448×252 to 896×504 — image size is nearly free |
+| capture (portal stream), warm | <0.05 ms | reading the newest frame from a slot |
+| capture (portal), first frame | ~140 ms | portal negotiation, paid once per session |
+| capture (per-call backend) | 15–60 ms | why streaming is preferred, and why `kwin` caps the reflex rate |
+| probe pass, 2 region probes | ~1.1 ms | subsampled; full-resolution it was 16 ms |
+| **whole reflex tick** | **~2.6 ms** | capture + probes + guards + latch update, live |
+| downscale 1080p → 896×504 | ~11 ms | PIL `BOX`; the numpy block mean it replaced cost ~103 ms |
+| vision prefill | ~28 ms | flat across image sizes — decode dominates |
 | decode, either model | ~22 ms/token | **this is the bottleneck** |
-| vision, 2 elements | ~1.0 s | ~21 tokens per reported element |
-| vision, 4 elements | ~2.2 s | why `max_elements` defaults to 3 |
-| actuator, cached prefix | 140–400 ms | depends almost entirely on note length |
+| vision, empty result | ~0.97 s | the floor: nothing found still costs a round trip |
+| vision, live at 644×364 | ~1.4 s p50 | ~21 tokens per reported element on top |
+| actuator, 20-action grammar | ~450 ms p50 | dominated by how long a burst it writes |
 | governor | ~50 µs | pure Python over a parsed burst |
 | burst execution | as specified | 40 inputs over 500 ms costs 500 ms |
 
-A cycle that skips vision costs about what the actuator costs (~150-200 ms tuned). A
-cycle that runs vision costs that plus ~500 ms per reported element. The design's whole
-job is maximising the fraction of cycles in the first category, and minimising the
-element count in the second.
+Two independent rates fall out of this. The **reflex loop** is bounded by the tick — 2.6 ms
+means it could run at several hundred Hz and is held to 20 by configuration, not by
+capability. The **decision loop** is bounded by the models: ~450 ms when vision is skipped,
+~1.9 s when it is not. Those are not close to each other, which is the entire reason the
+two are separate loops rather than one.
+
+The design's job on the decision side is maximising the fraction of cycles that skip
+vision, and minimising the element count on the ones that do not. Its job on the reflex
+side is keeping the tick small enough that the rate is a choice.
 
 ### The levers, in order of impact
 
@@ -108,6 +116,17 @@ latency at the original 48-char limit), and the compact `[idx,x1,y1,x2,y2]` elem
 encoding (27–29% fewer tokens than the object form). The original design assumed vision
 was prefill-bound and tuned micro-batches accordingly; that was wrong, and `voltage bench`
 is what showed it.
+
+The corollary bit later, and is worth stating separately: **the token ceiling must be at
+least what the grammar permits.** These are two numbers describing the same limit, and
+when they disagreed — a grammar allowing 20 actions, a fixed 96-token ceiling — the
+sampler stopped part-way through an action and the reply did not parse, discarding the
+whole cycle. It failed only on the cycles where the model had the most to say, which is
+the worst possible distribution. `actuator_token_budget` derives one from the other.
+
+Capping tokens is also not a way to make a grammar-constrained model faster. Output length
+is set by the grammar; a lower ceiling does not shorten the burst, it breaks it. The way
+to get a shorter burst is `max_actions_per_burst`, which regenerates the grammar.
 
 **1. Bursts.** The unit of actuation is a programme, not an input:
 

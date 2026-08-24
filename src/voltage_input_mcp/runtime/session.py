@@ -701,7 +701,7 @@ class Session:
             frame = frame.crop(x - frame.origin[0], y - frame.origin[1], w, h)
         result.frame = frame
 
-        if not self._should_run_vision(settings, result.probes):
+        if not self._should_run_vision(settings, sample.frame):
             result.observation = self._last_observation
             result.source = "cache" if self._last_observation.elements else "skipped"
             return result
@@ -726,7 +726,7 @@ class Session:
         result.source = "vlm"
         return result
 
-    def _should_run_vision(self, settings: Perception, probes: dict[str, float]) -> bool:
+    def _should_run_vision(self, settings: Perception, frame: Frame) -> bool:
         if settings.mode == "never":
             return False
         if settings.mode == "always":
@@ -740,7 +740,9 @@ class Session:
         # on_change. Measured against the frame vision last saw, not against the previous
         # frame: with the reflex loop sampling at 20 Hz, "changed since the last frame"
         # answers a question about the last 50 ms, which is not what this gate is for.
-        return probes.get("__delta_vs_vision__", 1.0) >= settings.change_threshold
+        # Computed live rather than read from the sample's probe dict -- that dict is a
+        # snapshot from before the last vision call moved the baseline.
+        return self.probes.delta_vs_vision(frame) >= settings.change_threshold
 
     async def _run_vision(
         self, state: CompiledState, frame: Frame, settings: Perception

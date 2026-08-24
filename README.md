@@ -183,7 +183,9 @@ Three consequences, each of which changed a default:
   ~1.5 s per perceived cycle. Set it to the number your guards actually test for.
 - **Shrinking `downscale_to` does not help and usually hurts.** 448×252 measured *2.5×
   slower* than 896×504 — a blurrier image makes the model less certain, so it emits more
-  tokens. Use the largest size that fits.
+  tokens. Use the largest size that fits. (It is at least honoured now: the downscaler
+  reduced by an integer factor and returned whatever that gave, so on a 1080p display
+  every request between 640 and 960 wide silently produced 960×540.)
 - **The actuator's `note` field cost 55% of its latency.** It is purely diagnostic, and
   at 48 chars it measured 412 ms/cycle against 184 ms at 12 chars and 140 ms at 0.
   Default is now 12.
