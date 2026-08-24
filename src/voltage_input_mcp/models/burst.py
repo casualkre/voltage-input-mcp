@@ -85,6 +85,7 @@ __all__ = [
     "ButtonDown",
     "ButtonUp",
     "Scroll",
+    "SetAxis",
     "Wait",
     "Burst",
     "parse_burst",
@@ -223,6 +224,24 @@ class Scroll(Action):
     def render(self) -> str:
         verb = "s" if self.axis == "v" else "h"
         return f"{verb}:{self.amount:+d}"
+
+
+@dataclass(frozen=True, slots=True)
+class SetAxis(Action):
+    """Set an analog gamepad axis to a fraction of its travel, and leave it there.
+
+    This is the verb that makes continuous control a value instead of a schedule. `a:ly,-0.7`
+    is "forward at seventy percent" -- one event, and it stays set until changed. The
+    keyboard equivalent is holding W, which is either full speed or nothing, and every
+    latch, dead band and minimum hold time in the reflex layer exists to manage that
+    binary-ness. None of that is needed here.
+    """
+
+    axis: str
+    value: float
+
+    def render(self) -> str:
+        return f"a:{self.axis},{self.value:+.2f}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,6 +525,36 @@ def parse_burst(
         elif verb == "e":
             actions.append(ButtonUp(button=_button(payload)))
 
+        elif verb == "a":
+            from ..inputs.keymap import PAD_AXES
+
+            if "," not in payload:
+                raise BurstParseError(
+                    f"axis needs '<axis>,<value>', got {payload!r}", source=src
+                )
+            axis, _, raw = payload.partition(",")
+            axis = axis.strip().lower()
+            if axis not in PAD_AXES:
+                raise BurstParseError(
+                    f"unknown axis {axis!r}; valid: {', '.join(sorted(PAD_AXES))} "
+                    f"(lx/ly left stick, rx/ry right stick, lt/rt triggers, dx/dy d-pad)",
+                    source=src,
+                )
+            try:
+                value = float(raw.strip())
+            except ValueError:
+                raise BurstParseError(
+                    f"axis value must be a number between -1 and 1, got {raw!r}",
+                    source=src,
+                ) from None
+            if not -1.0 <= value <= 1.0:
+                raise BurstParseError(
+                    f"axis value {value} is outside -1.0..1.0; it is a fraction of the "
+                    f"stick's travel, not a raw kernel value",
+                    source=src,
+                )
+            actions.append(SetAxis(axis=axis, value=value))
+
         elif verb in ("s", "h"):
             amount = _int_arg(payload, "scroll", -MAX_SCROLL, MAX_SCROLL)
             if amount == 0:
@@ -521,7 +570,7 @@ def parse_burst(
         else:
             raise BurstParseError(
                 f"unknown verb {verb!r} in {token!r}; valid verbs are "
-                f"k d u t g m r c p e s h w",
+                f"k d u t g m r c p e s h w a",
                 source=src,
             )
 

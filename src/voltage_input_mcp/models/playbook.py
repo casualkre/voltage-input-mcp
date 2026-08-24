@@ -61,7 +61,7 @@ __all__ = [
 
 TERMINALS: frozenset[str] = frozenset({"@success", "@failure", "@stop"})
 
-VERBS: tuple[str, ...] = ("k", "d", "u", "t", "g", "m", "r", "c", "p", "e", "s", "h", "w")
+VERBS: tuple[str, ...] = ("k", "d", "u", "t", "g", "m", "r", "c", "p", "e", "s", "h", "w", "a")
 VERB_NAMES: dict[str, str] = {
     "k": "key chord",
     "d": "key down",
@@ -76,6 +76,7 @@ VERB_NAMES: dict[str, str] = {
     "s": "scroll",
     "h": "horizontal scroll",
     "w": "wait",
+    "a": "set gamepad axis",
 }
 
 Ident = Annotated[str, Field(pattern=r"^[a-zA-Z_][a-zA-Z0-9_]{0,39}$")]

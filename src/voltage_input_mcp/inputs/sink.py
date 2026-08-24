@@ -46,5 +46,14 @@ class InputSink(Protocol):
     def move_rel(self, dx: int, dy: int) -> None:
         """Move the pointer by a delta."""
 
+    def axis(self, name: str, value: float) -> None:
+        """Set an analog gamepad axis to a fraction of travel in -1.0..1.0.
+
+        Optional: a sink with no gamepad may do nothing. The executor checks for the
+        method rather than assuming it, because Windows has no equivalent virtual pad
+        without a third-party driver and silently pretending otherwise would make a
+        playbook look portable when it is not.
+        """
+
     def scroll(self, amount: int, axis: str = "v") -> None:
         """Scroll by `amount` detents; axis is "v" or "h"."""

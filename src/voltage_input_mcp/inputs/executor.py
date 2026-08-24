@@ -73,6 +73,7 @@ from ..models.burst import (
     MoveAbs,
     MoveRel,
     Scroll,
+    SetAxis,
     TypeText,
     Wait,
 )
@@ -172,6 +173,7 @@ class Executor:
         self._held_keys: dict[str, float] = {}
         self._held_buttons: dict[str, float] = {}
         self._supervised: set[str] = set()
+        self._axes: dict[str, float] = {}
         self._cursor: tuple[int, int] = (0, 0)
         self._clipboard_tool = _detect_clipboard_tool()
 
@@ -206,6 +208,19 @@ class Executor:
         """
         released: list[str] = []
         self._supervised.clear()
+        # Centre anything deflected. A stick left at 0.8 keeps the character walking
+        # into a wall after the run has ended, and unlike a held key it is invisible.
+        for name in list(self._axes):
+            if self._axes[name]:
+                if not self.dry_run:
+                    setter = getattr(self.devices, "axis", None)
+                    if setter is not None:
+                        try:
+                            setter(name, 0.0)
+                        except InputDeviceError:
+                            pass
+                released.append(f"axis:{name}")
+            self._axes.pop(name, None)
         if self.dry_run:
             self._held_keys.clear()
             self._held_buttons.clear()
@@ -404,6 +419,10 @@ class Executor:
             return cursor
         if isinstance(action, Scroll):
             return self._do_scroll(action, cursor)
+        if isinstance(action, SetAxis):
+            self._wait_until(cursor)
+            self._do_axis(action.axis, action.value)
+            return cursor
 
         raise InputDeviceError(f"no handler for action {type(action).__name__}")
 
@@ -568,6 +587,21 @@ class Executor:
         if self.dry_run or (dx == 0 and dy == 0):
             return
         self.devices.move_rel(dx, dy)
+
+    def _do_axis(self, name: str, value: float) -> None:
+        """Set an axis and remember it, so `release_all` can centre the sticks.
+
+        An axis left deflected is the analog equivalent of a stuck key, and worse in one
+        respect: a held key is at least visible in `held()`, whereas a stick resting at
+        0.8 looks like nothing at all. Tracking them means the panic path can centre
+        everything it moved.
+        """
+        self._axes[name] = value
+        if self.dry_run:
+            return
+        setter = getattr(self.devices, "axis", None)
+        if setter is not None:
+            setter(name, value)
 
     def _do_scroll(self, action: Scroll, cursor: float) -> float:
         t = cursor

@@ -41,7 +41,7 @@ import fcntl
 import os
 import struct
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
@@ -123,6 +123,16 @@ class DeviceCaps:
     vendor: int = 0x1D6B  # Linux Foundation
     product: int = 0x0001
     version: int = 0x0100
+    # Per-axis ranges. A pointer wants one range for every axis; a gamepad does not --
+    # sticks are signed and centred, triggers are unsigned and rest at zero, and the hat
+    # is -1..1. Declaring the wrong range does not fail loudly, it makes the pad rest at
+    # full deflection, which reads as a stick jammed hard over.
+    abs_ranges: Mapping[int, tuple[int, int]] | None = None
+
+    def abs_range(self, code: int) -> tuple[int, int]:
+        if self.abs_ranges is not None and code in self.abs_ranges:
+            return self.abs_ranges[code]
+        return 0, ABS_MAX
 
 
 class UInputDevice:
@@ -193,7 +203,8 @@ class UInputDevice:
             for code in caps.abs_axes:
                 fcntl.ioctl(fd, UI_SET_ABSBIT, code)
                 # value, min, max, fuzz, flat, resolution
-                absinfo = struct.pack(_ABS_SETUP_FMT, code, 0, 0, ABS_MAX, 0, 0, 0)
+                lo, hi = self._caps.abs_range(code)
+                absinfo = struct.pack(_ABS_SETUP_FMT, code, 0, lo, hi, 0, 0, 0)
                 fcntl.ioctl(fd, UI_ABS_SETUP, absinfo)
 
         if caps.misc:
@@ -307,6 +318,26 @@ def pointer_abs_caps() -> DeviceCaps:
     )
 
 
+def gamepad_caps() -> DeviceCaps:
+    """A virtual Xbox-style pad.
+
+    Declaring BTN_SOUTH is what makes this a *gamepad* rather than an unclassifiable
+    absolute device. udev's input_id builtin tags a device with ABS_X/ABS_Y as a joystick
+    only when it also advertises a button in the BTN_GAMEPAD range, and games and SDL
+    both key off that tag. Without it the pad is invisible to everything that matters.
+
+    No INPUT_PROP is declared on purpose: POINTER would drag it back toward being treated
+    as a mouse, which is the thing being avoided.
+    """
+    return DeviceCaps(
+        name="voltage-gamepad",
+        keys=tuple(km.PAD_BUTTONS.values()),
+        abs_axes=tuple(km.PAD_AXES.values()),
+        abs_ranges={c: km.pad_axis_range(c) for c in km.PAD_AXES.values()},
+        product=0x0104,
+    )
+
+
 def pointer_rel_caps() -> DeviceCaps:
     return DeviceCaps(
         name="voltage-pointer-rel",
@@ -330,15 +361,23 @@ class DeviceSet:
     """
 
     screen: tuple[int, int] = (1920, 1080)
+    # A virtual gamepad is created alongside the rest, but only opened when something
+    # actually asks for an axis. It is cheap to declare and not free to create: every
+    # extra device is another thing udev enumerates and another `js*` node appearing on
+    # the user's system, which should not happen for a playbook that never touches it.
+    gamepad_enabled: bool = True
     keyboard: UInputDevice = field(init=False)
     pointer_abs: UInputDevice = field(init=False)
     pointer_rel: UInputDevice = field(init=False)
+    gamepad: UInputDevice = field(init=False)
     _open: bool = field(default=False, init=False)
+    _pad_open: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.keyboard = UInputDevice(keyboard_caps())
         self.pointer_abs = UInputDevice(pointer_abs_caps())
         self.pointer_rel = UInputDevice(pointer_rel_caps())
+        self.gamepad = UInputDevice(gamepad_caps())
 
     def open(self) -> None:
         if self._open:
@@ -352,9 +391,37 @@ class DeviceSet:
         self._open = True
 
     def close(self) -> None:
-        for dev in (self.pointer_rel, self.pointer_abs, self.keyboard):
+        for dev in (self.gamepad, self.pointer_rel, self.pointer_abs, self.keyboard):
             dev.close()
         self._open = False
+        self._pad_open = False
+
+    def _ensure_pad(self) -> bool:
+        """Open the gamepad on first use, and settle for it specifically.
+
+        Created lazily so a keyboard-and-mouse playbook never makes a `js0` node appear.
+        The settle is not optional: a pad written to before udev has enumerated it drops
+        those first events silently, which looks like the axis verb not working.
+        """
+        if not self.gamepad_enabled:
+            return False
+        if self._pad_open:
+            return True
+        self.gamepad.open(settle=False)
+        time.sleep(SETTLE_SECONDS)
+        self._pad_open = True
+        return True
+
+    def axis(self, name: str, value: float) -> None:
+        """Set an analog axis to a fraction of its travel, -1.0 to +1.0."""
+        code = km.PAD_AXES.get(name)
+        if code is None:
+            raise InputDeviceError(
+                f"unknown axis {name!r}; valid: {', '.join(sorted(km.PAD_AXES))}"
+            )
+        if not self._ensure_pad():
+            return
+        self.gamepad.emit([(km.EV_ABS, code, km.pad_axis_value(name, value))], sync=True)
 
     @property
     def is_open(self) -> bool:

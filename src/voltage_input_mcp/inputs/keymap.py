@@ -204,3 +204,83 @@ def ascii_to_keys(char: str) -> tuple[int, bool] | None:
 def is_typeable(text: str) -> bool:
     """True if every character can be produced by a single US-layout keystroke."""
     return all(ascii_to_keys(c) is not None for c in text)
+
+
+# --------------------------------------------------------------------------------------
+# Gamepad
+# --------------------------------------------------------------------------------------
+# Values verified against /usr/include/linux/input-event-codes.h rather than recalled.
+#
+# Why a gamepad at all: a key is binary. Every hard problem in the reflex layer -- latches,
+# hysteresis, chatter, minimum hold times, interpolated steering bursts -- exists because
+# "forward" can only be fully on or fully off, so continuous control has to be forged out
+# of timing. An analog axis is a *magnitude*: "forward at 0.7" is one value that stays set,
+# and the entire category of problem goes away rather than being managed.
+
+ABS_Z: Final = 0x02
+ABS_RX: Final = 0x03
+ABS_RY: Final = 0x04
+ABS_RZ: Final = 0x05
+ABS_HAT0X: Final = 0x10
+ABS_HAT0Y: Final = 0x11
+
+BTN_SOUTH: Final = 0x130      # A / cross
+BTN_EAST: Final = 0x131       # B / circle
+BTN_NORTH: Final = 0x133      # Y / triangle
+BTN_WEST: Final = 0x134       # X / square
+BTN_TL: Final = 0x136         # left bumper
+BTN_TR: Final = 0x137         # right bumper
+BTN_TL2: Final = 0x138
+BTN_TR2: Final = 0x139
+BTN_SELECT: Final = 0x13A
+BTN_START: Final = 0x13B
+BTN_MODE: Final = 0x13C       # guide / home
+BTN_THUMBL: Final = 0x13D
+BTN_THUMBR: Final = 0x13E
+
+# Stick axes are signed and centred; triggers are unsigned and rest at zero. Using the
+# Xbox-style ranges rather than inventing our own means games that auto-detect a pad get
+# the deadzone and curve handling they already ship with.
+STICK_MIN: Final = -32768
+STICK_MAX: Final = 32767
+TRIGGER_MIN: Final = 0
+TRIGGER_MAX: Final = 255
+
+PAD_AXES: dict[str, int] = {
+    "lx": ABS_X, "ly": ABS_Y,
+    "rx": ABS_RX, "ry": ABS_RY,
+    "lt": ABS_Z, "rt": ABS_RZ,
+    "dx": ABS_HAT0X, "dy": ABS_HAT0Y,
+}
+
+PAD_BUTTONS: dict[str, int] = {
+    "a": BTN_SOUTH, "b": BTN_EAST, "x": BTN_WEST, "y": BTN_NORTH,
+    "lb": BTN_TL, "rb": BTN_TR,
+    "back": BTN_SELECT, "start": BTN_START, "guide": BTN_MODE,
+    "ls": BTN_THUMBL, "rs": BTN_THUMBR,
+}
+
+
+def pad_axis_range(code: int) -> tuple[int, int]:
+    """Kernel range for one axis: sticks are centred, triggers and the d-pad are not."""
+    if code in (ABS_Z, ABS_RZ):
+        return TRIGGER_MIN, TRIGGER_MAX
+    if code in (ABS_HAT0X, ABS_HAT0Y):
+        return -1, 1
+    return STICK_MIN, STICK_MAX
+
+
+def pad_axis_value(name: str, fraction: float) -> int:
+    """Map a -1.0..+1.0 request onto the axis's kernel range.
+
+    Triggers take 0..1 and clamp below zero, because a trigger has no negative half and
+    silently wrapping a negative request to full pull would be the worst kind of wrong.
+    """
+    code = PAD_AXES[name]
+    lo, hi = pad_axis_range(code)
+    value = max(-1.0, min(1.0, float(fraction)))
+    if lo == 0:
+        return int(round(max(0.0, value) * hi))
+    if code in (ABS_HAT0X, ABS_HAT0Y):
+        return 1 if value > 0.5 else (-1 if value < -0.5 else 0)
+    return int(round(value * (hi if value >= 0 else -lo)))
