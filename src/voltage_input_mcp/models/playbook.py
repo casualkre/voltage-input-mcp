@@ -102,7 +102,9 @@ class ProbeSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: Ident
-    type: Literal["pixel", "region_mean", "region_diff", "brightness", "template"]
+    type: Literal[
+        "pixel", "region_mean", "region_diff", "brightness", "template", "number"
+    ]
     at: tuple[int, int] | None = Field(default=None, description="pixel probes: (x, y)")
     region: Rect | None = Field(default=None, description="region probes: area to measure")
     expect: str | None = Field(
@@ -112,6 +114,23 @@ class ProbeSpec(BaseModel):
     template: str | None = Field(default=None, description="template: path to a PNG")
     threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     channel: Literal["rgb", "r", "g", "b", "luma"] = "rgb"
+
+    # -- number probes ---------------------------------------------------------------
+    # Reading a HUD number is what turns a guard into a physics condition:
+    # `probe('mph') > 120 and probe('meters') < 150` is the difference between flying a
+    # character and jumping off and praying. OCR costs ~80-200 ms, far too slow for the
+    # reflex path, so it runs on a cadence and every cycle in between reads the cached
+    # value at no cost. Reflexes therefore fire on real numbers at full frame rate.
+    ocr_every: int = Field(
+        default=3, ge=1, le=60,
+        description="re-read every N frames; in between, the cached value is reused",
+    )
+    invert: bool = Field(
+        default=False, description="set for dark text on a light background"
+    )
+    scale: float = Field(
+        default=1.0, description="multiply the parsed number, e.g. 0.001 for thousands"
+    )
 
     @model_validator(mode="after")
     def _check_shape(self) -> ProbeSpec:
@@ -128,6 +147,9 @@ class ProbeSpec(BaseModel):
         elif self.type == "template":
             if self.template is None or self.region is None:
                 raise ValueError("template probe needs `template` and a search `region`")
+        elif self.type == "number":
+            if self.region is None:
+                raise ValueError("number probe needs a `region` containing the digits")
         return self
 
 

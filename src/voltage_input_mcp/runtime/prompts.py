@@ -93,6 +93,7 @@ def actuator_prompt(
     last_result: str = "",
     steer_hint: str | None = None,
     cycles_in_state: int = 0,
+    probes: dict[str, float] | None = None,
 ) -> str:
     """The per-cycle text for the actuator.
 
@@ -119,6 +120,23 @@ def actuator_prompt(
         parts.append("TEXT: " + " | ".join(t[:60] for t in observation.texts[:3]))
     if observation.flags:
         parts.append("FLAGS: " + ", ".join(sorted(observation.flags)))
+
+    # Numeric probes, with their rate of change. This is what lets the actuator fly
+    # rather than jump and hope: "descending at 170 and 116 m up" is a decision, "there
+    # is a screenshot" is not. Rates are shown as +/- per second so the model can read a
+    # trend without differencing anything itself.
+    if probes:
+        readings = []
+        for key, value in probes.items():
+            if key.startswith("__") or key.endswith("__rate"):
+                continue
+            rate = probes.get(f"{key}__rate")
+            if rate is not None and abs(rate) >= 0.5:
+                readings.append(f"{key}={value:g} ({rate:+.0f}/s)")
+            else:
+                readings.append(f"{key}={value:g}")
+        if readings:
+            parts.append("READINGS: " + "  ".join(readings[:8]))
 
     if variables:
         rendered = ", ".join(f"{k}={v}" for k, v in list(variables.items())[:8])

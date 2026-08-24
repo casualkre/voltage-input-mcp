@@ -73,6 +73,13 @@ class SessionOptions:
     vision_temperature: float = 0.1
     actuator_temperature: float = 0.25
     watch_physical_input: bool = True
+    # The reflex loop runs independently of the decision loop, at capture rate. This is
+    # the whole point of the small-model design and it was previously wasted: reflexes
+    # were evaluated once per decision cycle, so a 0.5 s loop gave 2 Hz reactions no
+    # matter how cheap the probes were. Capture is ~2 ms and probes ~40 us, so 20-30 Hz
+    # costs almost nothing and is what makes air control or a dodge possible at all.
+    reflex_hz: float = 20.0
+    reflex_enabled: bool = True
 
 
 @dataclass(slots=True)
@@ -151,6 +158,14 @@ class Session:
         # reflex id -> (last fire time, fire count). Reset on every state entry.
         self._rule_fired: dict[str, tuple[float, int]] = {}
         self._grammar_cache: dict[tuple, str] = {}
+        self._reflex_task: asyncio.Task[None] | None = None
+        self._reflex_fires = 0
+        self._reflex_probes: dict[str, float] = {}
+        # When an exclusive reflex fires in the fast loop, the next decision is skipped.
+        # `exclusive` meant "suppress the actuator this cycle" when reflexes were checked
+        # inside the cycle; with them decoupled it has to mean "the reaction already
+        # happened, do not let a 300 ms-stale decision override it".
+        self._reflex_suppress_until = 0.0
         self._timings: dict[str, list[float]] = {"capture": [], "vision": [], "actuator": [],
                                                  "execute": [], "cycle": []}
 
@@ -175,6 +190,11 @@ class Session:
             initial=self.state_name,
             warnings=self.playbook.warnings,
         )
+
+        if self.options.reflex_enabled:
+            self._reflex_task = asyncio.create_task(
+                self._reflex_loop(), name=f"voltage-reflex-{self.id}"
+            )
 
         try:
             await self._enter_state(self.state_name, first=True)
@@ -212,7 +232,85 @@ class Session:
         finally:
             await self._cleanup()
 
+    async def _reflex_loop(self) -> None:
+        """Capture, probe and fire reflexes at `reflex_hz`, independent of decisions.
+
+        Deliberately does not touch the vision model or the actuator. It captures a
+        frame, evaluates the probes -- which for a number probe means reading a cached
+        value, not paying for OCR -- and fires any reflex whose guard holds. That path is
+        a couple of milliseconds end to end, so it can run at 20-30 Hz while the decision
+        loop plods along at 2 Hz underneath it.
+
+        This is where the responsiveness the small models were chosen for actually lives.
+        A decision loop cannot dodge; a reflex can.
+        """
+        period = 1.0 / max(1.0, self.options.reflex_hz)
+        while self.status in ("running", "paused"):
+            started = time.perf_counter()
+            try:
+                if self.status == "running" and not self.killswitch.tripped:
+                    await self._reflex_tick()
+            except asyncio.CancelledError:
+                return
+            except Exception:  # noqa: BLE001 - a reflex must never kill the run
+                pass
+            remaining = period - (time.perf_counter() - started)
+            await asyncio.sleep(max(0.002, remaining))
+
+    async def _reflex_tick(self) -> None:
+        state = self.playbook.states.get(self.state_name)
+        if state is None or not state.reflexes:
+            return
+
+        frame = await asyncio.to_thread(self.deps.capture.grab, None)
+        probes = await asyncio.to_thread(self.probes.evaluate, frame)
+        self._reflex_probes = probes
+
+        ctx = GuardContext(
+            elements=[
+                {"label": e.label, "conf": e.conf} for e in self._last_observation.elements
+            ],
+            texts=list(self._last_observation.texts),
+            flags=set(self._last_observation.flags),
+            scene=self._last_observation.scene,
+            probes=dict(probes),
+            vars=self.vars,
+            state={
+                "name": self.state_name,
+                "cycles": self._cycles_in_state,
+                "elapsed": time.monotonic() - self._state_entered_at,
+            },
+            run={"cycles": self._cycle, "elapsed": time.monotonic() - self._started_at},
+        )
+
+        picked = self._pick_reflex(state, ctx)
+        if picked is None:
+            return
+        _guard, burst, rule = picked
+
+        verdict = self.governor.review(
+            burst, observation=self._last_observation,
+            allow_verbs=state.allow_verbs, source=f"reflex:{rule.id}",
+        )
+        if not verdict.allowed or not burst.actions:
+            return
+
+        self._rule_fired[rule.id] = (
+            time.monotonic(), self._rule_fired.get(rule.id, (0.0, 0))[1] + 1
+        )
+        self._reflex_fires += 1
+        if rule.exclusive:
+            self._reflex_suppress_until = time.monotonic() + self.options.target_period_s
+        await asyncio.to_thread(self.deps.executor.run, burst, label=f"reflex:{rule.id}")
+        self.journal.event(
+            "reflex", rule=rule.id, burst=burst.render(),
+            probes={k: round(v, 3) for k, v in probes.items() if not k.startswith("__")},
+        )
+
     async def _cleanup(self) -> None:
+        if self._reflex_task is not None:
+            self._reflex_task.cancel()
+            self._reflex_task = None
         if self._pending is not None:
             self._pending.cancel()
             self._pending = None
@@ -280,8 +378,9 @@ class Session:
             self._finish("failed", "failure_when matched")
             return False
 
-        # 2. Reflexes: no model in the path.
-        reflex = self._pick_reflex(state, ctx)
+        # 2. Reflexes -- only when the fast loop is off. With it on, reflexes fire there
+        # at reflex_hz instead, and firing here as well would double every reaction.
+        reflex = None if self.options.reflex_enabled else self._pick_reflex(state, ctx)
         if reflex is not None:
             guard, burst, rule = reflex
             record.burst_source = f"reflex:{rule.id}"
@@ -314,8 +413,13 @@ class Session:
             self._finalise_cycle(record, cycle_start)
             return target not in TERMINALS
 
-        # 5. The actuator.
-        if state.spec.autonomous:
+        # 5. The actuator -- unless an exclusive reflex just reacted. Letting a decision
+        # made from a 300 ms-old frame override a reaction made 20 ms ago is exactly
+        # backwards.
+        if time.monotonic() < self._reflex_suppress_until:
+            record.note = (record.note or "exclusive reflex fired; actuator skipped")
+            record.burst_source = record.burst_source or "reflex"
+        elif state.spec.autonomous:
             await self._actuate(state, percept, record)
 
         self._finalise_cycle(record, cycle_start)
@@ -486,6 +590,7 @@ class Session:
             last_result=self._last_result,
             steer_hint=self._steer_hint,
             cycles_in_state=self._cycles_in_state,
+            probes=percept.probes or self._reflex_probes,
         )
 
         t0 = time.perf_counter()
@@ -698,6 +803,8 @@ class Session:
                 "cycles": self._cycle,
                 "elapsed": time.monotonic() - self._started_at,
                 "bursts": self._bursts,
+            "reflex_fires": self._reflex_fires,
+            "reflex_hz": self.options.reflex_hz if self.options.reflex_enabled else 0,
                 "rejections": self.governor.rejections,
                 "last_burst_ok": self._last_result in ("ok", ""),
             },
@@ -819,6 +926,8 @@ class Session:
             "cycles": self._cycle,
             "cycles_in_state": self._cycles_in_state,
             "bursts": self._bursts,
+            "reflex_fires": self._reflex_fires,
+            "reflex_hz": self.options.reflex_hz if self.options.reflex_enabled else 0,
             "elapsed_s": round(elapsed, 1),
             "vars": dict(self.vars),
             "last_burst": self._last_burst,

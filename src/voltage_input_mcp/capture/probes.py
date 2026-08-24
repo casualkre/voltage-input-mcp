@@ -24,6 +24,7 @@ whether the vision model runs at all this cycle.
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -33,7 +34,7 @@ import numpy as np
 from ..models.playbook import ProbeSpec, Rect
 from .base import Frame
 
-__all__ = ["ProbeEngine", "parse_hex_colour"]
+__all__ = ["ProbeEngine", "parse_hex_colour", "ocr_available"]
 
 # The whole-frame change detector runs on a thumbnail. Full-resolution differencing of a
 # 1080p frame costs ~4 ms; at 160x90 it costs ~40 us and detects exactly the same
@@ -61,9 +62,17 @@ class ProbeEngine:
     _templates: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     _static_since: float = field(default_factory=time.monotonic, init=False)
     _last_values: dict[str, float] = field(default_factory=dict, init=False)
+    _numbers: dict[str, float] = field(default_factory=dict, init=False)
+    _number_at: dict[str, float] = field(default_factory=dict, init=False)
+    _rates: dict[str, float] = field(default_factory=dict, init=False)
+    _ocr_ticks: dict[str, int] = field(default_factory=dict, init=False)
 
     def reset(self) -> None:
         self._prev_thumb = None
+        self._numbers.clear()
+        self._number_at.clear()
+        self._rates.clear()
+        self._ocr_ticks.clear()
         self._prev_regions.clear()
         self._static_since = time.monotonic()
         self._last_values.clear()
@@ -88,10 +97,50 @@ class ProbeEngine:
             except Exception:  # noqa: BLE001 - a broken probe must not stop the loop
                 values[spec.id] = 0.0
 
+        # Derivatives ride alongside, so `probe('meters__rate')` is available without the
+        # playbook differencing anything itself.
+        for key, rate in self._rates.items():
+            values[f"{key}__rate"] = rate
+
         self._last_values = values
         return values
 
     # -- individual probes -----------------------------------------------------------
+
+    def _number(self, spec: ProbeSpec, frame: Frame) -> float:
+        """Read a number off the HUD.
+
+        Two-tier by necessity. OCR is 80-200 ms -- unusable in the reflex path -- so it
+        runs every `ocr_every` frames and the cached value serves in between. A reflex
+        guarding on `probe('mph')` therefore evaluates in microseconds against a number
+        that is at most a few frames stale, which for a falling character is fine and
+        for a menu is exact.
+        """
+        self._ocr_ticks[spec.id] = self._ocr_ticks.get(spec.id, 0) + 1
+        cached = self._numbers.get(spec.id)
+        if cached is not None and self._ocr_ticks[spec.id] % spec.ocr_every:
+            return cached
+
+        assert spec.region is not None
+        patch = self._patch(spec.region, frame)
+        if patch.size == 0:
+            return cached if cached is not None else 0.0
+
+        value = _ocr_number(patch, invert=spec.invert)
+        if value is None:
+            return cached if cached is not None else 0.0
+
+        value *= spec.scale
+        now = time.monotonic()
+        previous, previous_at = self._numbers.get(spec.id), self._number_at.get(spec.id)
+        if previous is not None and previous_at and now > previous_at:
+            # Rate of change, published as `<id>__rate`. This is what makes descent
+            # speed, income per second and progress bars usable in a guard without the
+            # playbook having to difference them by hand.
+            self._rates[spec.id] = (value - previous) / (now - previous_at)
+        self._numbers[spec.id] = value
+        self._number_at[spec.id] = now
+        return value
 
     def _evaluate_one(self, spec: ProbeSpec, frame: Frame) -> float:
         if spec.type == "pixel":
@@ -104,6 +153,8 @@ class ProbeEngine:
             return self._region_diff(spec, frame)
         if spec.type == "template":
             return self._template(spec, frame)
+        if spec.type == "number":
+            return self._number(spec, frame)
         return 0.0
 
     def _pixel(self, spec: ProbeSpec, frame: Frame) -> float:
@@ -206,6 +257,110 @@ class ProbeEngine:
         if prev is None or prev.shape != thumb.shape:
             return 1.0  # first frame counts as fully changed, so perception runs
         return float((np.abs(thumb - prev) > _PIXEL_CHANGE_THRESHOLD).mean())
+
+
+_NUMBER_RE = re.compile(r"-?\d[\d,.]*")
+
+
+_OCR_STATUS: dict[str, str] = {}
+
+
+def ocr_available() -> tuple[bool, str]:
+    """Whether OCR can actually read anything, and why not if it cannot.
+
+    Checking only for the tesseract binary is not enough: the language data is a separate
+    package on most distributions, and without it tesseract exits with an error for every
+    call. A number probe would then return 0 forever, which a playbook reads as a real
+    measurement -- a guard on `probe('health') < 0.25` would fire permanently.
+    """
+    import shutil
+    import subprocess
+
+    if cached := _OCR_STATUS.get("state"):
+        return cached == "ok", _OCR_STATUS.get("detail", "")
+
+    if shutil.which("tesseract") is None:
+        _OCR_STATUS.update(
+            state="missing",
+            detail="tesseract is not installed; number probes will not work. "
+                   "Arch: sudo pacman -S tesseract tesseract-data-eng  |  "
+                   "Debian/Ubuntu: sudo apt install tesseract-ocr",
+        )
+        return False, _OCR_STATUS["detail"]
+
+    try:
+        proc = subprocess.run(
+            ["tesseract", "--list-langs"], capture_output=True, timeout=5.0, check=False
+        )
+        langs = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _OCR_STATUS.update(state="broken", detail=f"tesseract failed to run: {exc}")
+        return False, _OCR_STATUS["detail"]
+
+    if "eng" not in langs.split():
+        _OCR_STATUS.update(
+            state="nolang",
+            detail="tesseract is installed but has no English language data, so every "
+                   "read fails. Arch: sudo pacman -S tesseract-data-eng  |  "
+                   "Debian/Ubuntu: sudo apt install tesseract-ocr-eng",
+        )
+        return False, _OCR_STATUS["detail"]
+
+    _OCR_STATUS.update(state="ok", detail="")
+    return True, ""
+
+
+def _ocr_number(patch: np.ndarray, *, invert: bool = False) -> float | None:
+    """Extract the first number in a small image region via tesseract.
+
+    Three preprocessing steps matter far more than the OCR settings do. Game HUD text is
+    small, so it is upscaled 4x before tesseract sees it; it is usually light-on-dark,
+    which tesseract handles badly, so it is inverted to dark-on-light; and it is
+    thresholded, because anti-aliased glyphs over a moving 3D background confuse the
+    segmenter more than low contrast does.
+    """
+    import subprocess
+    import tempfile
+
+    ready, _ = ocr_available()
+    if not ready:
+        return None
+
+    grey = patch.mean(axis=2).astype(np.float32)
+    if not invert:
+        grey = 255.0 - grey                      # light text -> dark text
+    threshold = grey.mean() * 0.85
+    binary = np.where(grey < threshold, 0, 255).astype(np.uint8)
+    binary = np.repeat(np.repeat(binary, 4, axis=0), 4, axis=1)
+
+    try:
+        from PIL import Image
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as handle:
+            Image.fromarray(binary, mode="L").save(handle, format="PNG")
+            path = handle.name
+        proc = subprocess.run(
+            ["tesseract", path, "stdout", "--psm", "7", "-c",
+             "tessedit_char_whitelist=0123456789.,-"],
+            capture_output=True, timeout=3.0, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    finally:
+        try:
+            import os
+
+            os.unlink(path)
+        except (OSError, NameError, UnboundLocalError):
+            pass
+
+    match = _NUMBER_RE.search(proc.stdout.decode("utf-8", "replace"))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def _thumbnail_luma(pixels: np.ndarray) -> np.ndarray:

@@ -222,8 +222,13 @@ class App:
                 "Install wl-clipboard."
             )
 
+        from .capture.probes import ocr_available
+
+        ocr_ok, ocr_detail = ocr_available()
         backends = detect_backends()
-        report["capture"] = {"available": backends}
+        report["capture"] = {"available": backends, "ocr": ocr_ok}
+        if not ocr_ok:
+            report["capture"]["ocr_detail"] = ocr_detail
         try:
             backend = self.capture()
             report["capture"]["selected"] = backend.name

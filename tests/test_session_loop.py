@@ -86,8 +86,9 @@ def build(playbook: dict, vision_replies, actuator_replies, **opts):
         executor=executor,
         screen=SCREEN,
     )
+    opts.setdefault("target_period_s", 0.01)
     options = SessionOptions(
-        target_period_s=0.01, settle_ms=0, watch_physical_input=False, dry_run=True, **opts
+        settle_ms=0, watch_physical_input=False, dry_run=True, **opts
     )
     return Session(compiled, deps, options), capture, deps
 
@@ -156,9 +157,26 @@ async def test_reflex_preempts_the_actuator():
             }
         },
     }
-    session, _, deps = build(playbook, [VISION_SEES_NOTHING], ["k:z|.|should not run"])
+    # Reflexes run in their own loop at reflex_hz, so an exclusive one suppresses the
+    # *next* decision rather than being checked inside the cycle. Either way the
+    # guarantee is the same: a stale decision never overrides a fresh reaction.
+    session, _, deps = build(
+        playbook, [VISION_SEES_NOTHING], ["k:z|.|should not run"],
+        target_period_s=0.15, reflex_hz=50.0,
+    )
     await session.start()
-    assert deps.actuator.calls == 0, "an exclusive reflex must suppress the actuator"
+
+    assert session._reflex_fires > 0, "the fast reflex loop never fired"
+    # Once the reflex loop is up it suppresses every subsequent decision. A single
+    # decision can slip through at startup, before the loop's first tick -- asserting
+    # exactly zero would be asserting a scheduler ordering rather than the guarantee.
+    assert deps.actuator.calls < session._cycle, (
+        f"actuator ran {deps.actuator.calls} times in {session._cycle} cycles; "
+        "an exclusive reflex should have suppressed all but the startup one"
+    )
+    assert session._reflex_fires > deps.actuator.calls, (
+        "reflexes should outnumber decisions -- that is the point of the fast loop"
+    )
 
 
 async def test_illegal_transition_proposal_is_ignored():

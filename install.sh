@@ -49,6 +49,10 @@ py_has() { python3 -c "import $1" >/dev/null 2>&1; }
 if [[ "$(uname)" == "Linux" ]]; then
   py_has gi   || MISSING+=(python-gobject)
   command -v wl-copy >/dev/null 2>&1 || command -v xclip >/dev/null 2>&1 || MISSING+=(wl-clipboard)
+  # tesseract AND its language data: the binary alone silently fails every read, which a
+  # number probe would report as a real value of 0.
+  command -v tesseract >/dev/null 2>&1 && tesseract --list-langs 2>&1 | grep -qw eng \
+    || MISSING+=(tesseract tesseract-data-eng)
   python3 -c "import gi;gi.require_version('Gst','1.0');from gi.repository import Gst" 2>/dev/null \
     || MISSING+=(gst-plugins-base gst-plugin-pipewire)
   if [[ ${#MISSING[@]} -eq 0 ]]; then
@@ -56,8 +60,8 @@ if [[ "$(uname)" == "Linux" ]]; then
   else
     no "missing: ${MISSING[*]}"
     if command -v pacman >/dev/null 2>&1;      then SUDO+=("pacman -S --needed ${MISSING[*]}")
-    elif command -v apt >/dev/null 2>&1;       then SUDO+=("apt install -y python3-gi gstreamer1.0-pipewire wl-clipboard")
-    elif command -v dnf >/dev/null 2>&1;       then SUDO+=("dnf install -y python3-gobject gstreamer1-plugins-base wl-clipboard")
+    elif command -v apt >/dev/null 2>&1;       then SUDO+=("apt install -y python3-gi gstreamer1.0-pipewire wl-clipboard tesseract-ocr tesseract-ocr-eng")
+    elif command -v dnf >/dev/null 2>&1;       then SUDO+=("dnf install -y python3-gobject gstreamer1-plugins-base wl-clipboard tesseract tesseract-langpack-eng")
     fi
   fi
 else

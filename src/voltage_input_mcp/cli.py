@@ -61,6 +61,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     )
     if health.get("note"):
         print(f"               {health['note']}")
+    print(f"  ocr          {'ok' if cap.get('ocr') else 'FAIL -- number probes disabled'}")
+    if cap.get("ocr_detail"):
+        print(f"               {cap['ocr_detail']}")
     print(f"  screen       {report.get('screen') or 'not detected yet'}")
     if cap.get("screen_note"):
         print(f"               {cap['screen_note']}")
