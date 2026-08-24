@@ -36,6 +36,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -121,6 +122,9 @@ class ProbeEngine:
     _rates: dict[str, float] = field(default_factory=dict, init=False)
     _ocr_asked: dict[str, float] = field(default_factory=dict, init=False)
     _ocr_inflight: dict[str, Future] = field(default_factory=dict, init=False)
+    _glyphs: dict[str, Any] = field(default_factory=dict, init=False)
+    _glyph_reads: int = field(default=0, init=False)
+    _glyph_misses: int = field(default=0, init=False)
     _ocr_reads: int = field(default=0, init=False)
     _ocr_misses: int = field(default=0, init=False)
     _pool: ThreadPoolExecutor | None = field(default=None, init=False)
@@ -159,7 +163,12 @@ class ProbeEngine:
         `voltage_diagnose` say "this probe has never produced a number" instead of the
         playbook author concluding the HUD really does say 0.
         """
-        return {"reads": self._ocr_reads, "misses": self._ocr_misses}
+        return {
+            "reads": self._ocr_reads,
+            "misses": self._ocr_misses,
+            "glyph_reads": self._glyph_reads,
+            "glyph_misses": self._glyph_misses,
+        }
 
     def mark_perceived(self, frame: Frame) -> None:
         """Record that the vision model has just looked at this frame.
@@ -250,6 +259,27 @@ class ProbeEngine:
         fresher absolute value would have been, and costs nothing.
         """
         assert spec.region is not None
+
+        # A learned glyph set turns this from a 80-200 ms OCR call that has to run on a
+        # background worker into a ~1 ms exact match that runs right here. When one
+        # exists there is no staleness window at all: the value is from this frame.
+        glyphs = self._glyph_set(spec)
+        if glyphs is not None:
+            patch = self._patch(spec.region, frame)
+            if patch.size:
+                value, confidence = glyphs.read(patch, invert=spec.invert)
+                if value is not None:
+                    self._glyph_reads += 1
+                    return self._record_number(spec, value * spec.scale)
+                # A refusal is information, not a failure: the HUD is covered, or the
+                # region moved. Falling through to the stale value is right, and
+                # `<id>__age` stops advancing so a latch guarding on it goes blind and
+                # releases rather than trusting a frozen reading.
+                self._glyph_misses += 1
+                with self._lock:
+                    cached = self._numbers.get(spec.id)
+                return cached if cached is not None else 0.0
+
         with self._lock:
             cached = self._numbers.get(spec.id)
 
@@ -274,6 +304,28 @@ class ProbeEngine:
 
         return cached if cached is not None else 0.0
 
+    def _glyph_set(self, spec: ProbeSpec):
+        """The learned glyph set for this probe, loaded once. None if never calibrated."""
+        if spec.id in self._glyphs:
+            return self._glyphs[spec.id]
+        from .glyphs import GlyphSet
+
+        loaded = GlyphSet.load(spec.glyphs or spec.id)
+        self._glyphs[spec.id] = loaded
+        return loaded
+
+    def _record_number(self, spec: ProbeSpec, value: float) -> float:
+        """Store a freshly read value and publish its rate. Shared by both read paths."""
+        now = time.monotonic()
+        with self._lock:
+            previous = self._numbers.get(spec.id)
+            previous_at = self._number_at.get(spec.id)
+            if previous is not None and previous_at and now > previous_at:
+                self._rates[spec.id] = (value - previous) / (now - previous_at)
+            self._numbers[spec.id] = value
+            self._number_at[spec.id] = now
+        return value
+
     def _worker(self) -> ThreadPoolExecutor:
         if self._pool is None:
             # One worker, deliberately. Number probes are read off small fixed HUD
@@ -289,18 +341,9 @@ class ProbeEngine:
             self._ocr_misses += 1
             return
         self._ocr_reads += 1
-        value *= spec.scale
-        now = time.monotonic()
-        with self._lock:
-            previous = self._numbers.get(spec.id)
-            previous_at = self._number_at.get(spec.id)
-            if previous is not None and previous_at and now > previous_at:
-                # Rate of change, published as `<id>__rate`. This is what makes descent
-                # speed, income per second and progress bars usable in a guard without
-                # the playbook having to difference them by hand.
-                self._rates[spec.id] = (value - previous) / (now - previous_at)
-            self._numbers[spec.id] = value
-            self._number_at[spec.id] = now
+        # Rate of change is published as `<id>__rate` by `_record_number`, shared with
+        # the glyph path so both read paths keep age and rate consistent.
+        self._record_number(spec, value * spec.scale)
 
     def _evaluate_one(self, spec: ProbeSpec, frame: Frame) -> float:
         if spec.type == "pixel":

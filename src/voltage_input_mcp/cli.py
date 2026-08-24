@@ -210,6 +210,66 @@ def cmd_reflex(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_learn_digits(args: argparse.Namespace) -> int:
+    """Learn the glyphs of one HUD number field, so it never needs OCR again.
+
+    Watches the region while the number changes, clusters the glyph shapes, and uses OCR
+    once -- as a teacher, voted across frames -- to label the clusters. From then on the
+    probe classifies by correlation: about a millisecond, exact, and inline rather than on
+    a background worker.
+
+    The number has to *change* during calibration. A counter sitting still shows one or
+    two glyphs and there is nothing to learn; the report says so rather than saving a set
+    that would fail on the first different value.
+    """
+    import time
+
+    from .app import get_app
+    from .capture.glyphs import GlyphLearner
+    from .capture.probes import _ocr_number, ocr_available
+
+    ready, detail = ocr_available()
+    if not ready:
+        print(f"OCR is needed as the teacher for calibration only: {detail}")
+        return 1
+
+    x, y, w, h = args.region
+    app = get_app(load_config(args.config))
+    capture = app.capture()
+    capture.grab()  # warm the stream
+
+    learner = GlyphLearner(invert=args.invert)
+    print(f"watching {w}x{h} at ({x},{y}) for {args.seconds:g}s -- "
+          f"make the number change during this")
+    deadline = time.monotonic() + args.seconds
+    while time.monotonic() < deadline:
+        frame = capture.grab()
+        patch = frame.pixels[y:y + h, x:x + w]
+        if patch.size:
+            learner.observe(patch, teacher_text=str(_ocr_number(patch, invert=args.invert)))
+        time.sleep(max(0.05, args.interval))
+
+    report = learner.report()
+    print(f"  frames {report['frames']}, teacher agreed on {report['frames_with_teacher']}, "
+          f"{report['clusters']} distinct shapes, {report['labelled']} labelled")
+
+    glyphs = learner.result()
+    if glyphs is None:
+        print("\n  NOT ENOUGH to learn a glyph set.")
+        print("  Most likely the number did not change, so only a few shapes were seen.")
+        print("  Re-run while the value moves through a range -- a score climbing, or an")
+        print("  altitude counting down -- so every digit appears at least a few times.")
+        return 1
+
+    path = glyphs.save(args.name)
+    print(f"\n  learned {len(glyphs.templates)} glyphs: "
+          f"{' '.join(sorted(glyphs.templates))}")
+    print(f"  saved to {path}")
+    print(f"\n  Now set  \"glyphs\": \"{args.name}\"  on that number probe, or name the")
+    print(f"  probe {args.name!r} and it will be picked up automatically.")
+    return 0
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     from .safety import write_panic
 
@@ -763,6 +823,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hz", type=float, default=20.0, help="rate to ask for (default 20)")
     p.add_argument("--seconds", type=float, default=5.0, help="how long to run")
     p.set_defaults(func=cmd_reflex)
+
+    p = sub.add_parser(
+        "learn-digits",
+        help="learn a HUD number field's glyphs so the probe stops needing OCR",
+    )
+    p.add_argument("name", help="glyph set name; use the probe id to be picked up automatically")
+    p.add_argument("--region", type=int, nargs=4, required=True,
+                   metavar=("X", "Y", "W", "H"), help="the digits, in desktop pixels")
+    p.add_argument("--seconds", type=float, default=20.0)
+    p.add_argument("--interval", type=float, default=0.25)
+    p.add_argument("--invert", action="store_true", help="dark text on a light background")
+    p.set_defaults(func=cmd_learn_digits)
 
     p = sub.add_parser("stop", help="emergency stop: halt every running loop")
     p.add_argument("reason", nargs="?", default="manual stop")

@@ -139,6 +139,17 @@ class ProbeSpec(BaseModel):
     invert: bool = Field(
         default=False, description="set for dark text on a light background"
     )
+    glyphs: str | None = Field(
+        default=None,
+        description=(
+            "name of a learned glyph set to read this number with, defaulting to the "
+            "probe id. Calibrate one with `voltage learn-digits` and the probe stops "
+            "using OCR entirely: reads become ~1 ms and exact instead of 80-200 ms and "
+            "approximate, and they run inline rather than on a background worker, so the "
+            "value is from this frame rather than one round trip stale. Falls back to OCR "
+            "when no set has been learned."
+        ),
+    )
     scale: float = Field(
         default=1.0, description="multiply the parsed number, e.g. 0.001 for thousands"
     )
