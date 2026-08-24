@@ -111,6 +111,105 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report.get("ready") else 1
 
 
+def cmd_reflex(args: argparse.Namespace) -> int:
+    """Measure what the fast layer actually achieves on this machine.
+
+    `doctor` predicts a sustainable rate from one capture timing. This runs the real loop
+    -- capture, probes, guards, a latch engaging and releasing -- against the real screen
+    and reports what happened. It is the difference between "20 Hz should work here" and
+    "20 Hz worked here", and it is worth having because every number in this project that
+    turned out to be wrong was one that had been predicted rather than measured.
+
+    Injects nothing: the run is dry, and the latch's key events are counted, not sent.
+    """
+    import asyncio
+
+    from .app import get_app
+    from .models.playbook import playbook_from_dict
+    from .runtime import Session
+
+    app = get_app(load_config(args.config))
+    screen = app.screen()
+    # A brightness probe over the middle of the screen, and a latch keyed to it. Whether
+    # the latch happens to engage depends on what is on screen, which is fine -- the
+    # measurement under test is the loop's rate and cost, not the guard.
+    playbook = playbook_from_dict({
+        "name": "reflex_check",
+        "goal": "Measure the fast loop.",
+        "initial": "measure",
+        "probes": [
+            {"id": "mid", "type": "brightness",
+             "region": {"x": screen[0] // 4, "y": screen[1] // 4,
+                        "w": screen[0] // 2, "h": screen[1] // 2}},
+            {"id": "motion", "type": "region_diff",
+             "region": {"x": screen[0] // 4, "y": screen[1] // 4,
+                        "w": screen[0] // 2, "h": screen[1] // 2}},
+        ],
+        "perception": {"mode": "never"},
+        "policy": {"dry_run": True, "allow_verbs": ["d", "u", "k", "w"],
+                   "allow_keys": ["w"]},
+        "budget": {"max_cycles": 10000, "max_seconds": max(1.0, args.seconds),
+                   "idle_abort_s": 0},
+        "states": {
+            "measure": {
+                "brief": "x",
+                "autonomous": False,
+                "reflex": [
+                    {"id": "latch", "when": "probe('mid') > 0.2",
+                     "release_when": "probe('mid') < 0.1", "hold": "w"},
+                ],
+                "transitions": [],
+            }
+        },
+    })
+
+    async def go() -> dict:
+        options = app.session_options(target_period_s=0.5, reflex_hz=args.hz)
+        options.dry_run = True
+        options.watch_physical_input = False
+        session = Session(playbook, app.session_deps(), options)
+        await session.start()
+        return session.snapshot()
+
+    print(f"running the fast loop for {args.seconds:g}s at {args.hz:g} Hz "
+          f"(dry: nothing is injected)...")
+    snap = asyncio.run(go())
+    reflex = snap["reflex"]
+    ticks = snap["timings"].get("reflex", {})
+    capture = snap["timings"].get("capture", {})
+
+    print()
+    print(f"  requested       {reflex['requested_hz']:g} Hz")
+    print(f"  measured        {reflex['measured_hz']:g} Hz over {reflex['ticks']} ticks")
+    if ticks:
+        print(f"  tick cost       {ticks['p50_ms']:.2f} ms p50, {ticks['p95_ms']:.2f} ms p95")
+    if capture:
+        print(f"  of which capture {capture['p50_ms']:.2f} ms p50")
+    print(f"  latch events    {reflex['latch_events']}"
+          f"  (engaged and released as the guard flipped)")
+    print(f"  starved         {reflex['starved']}")
+    for where, err in (reflex.get("errors") or {}).items():
+        print(f"  error [{where}]  {err}")
+    print(f"  probes now      "
+          f"{ {k: round(v, 3) for k, v in snap['probes'].items() if not k.startswith('__')} }")
+
+    achieved = float(reflex["measured_hz"])
+    print()
+    if achieved >= args.hz * 0.85:
+        print(f"  OK  the fast layer holds {achieved:g} Hz here. Reflex and hold rules "
+              f"will react within ~{1000 / max(achieved, 1):.0f} ms.")
+        return 0
+    print(f"  SLOW  asked for {args.hz:g} Hz and got {achieved:g}. Guard timings in a "
+          f"playbook will be coarser than written.")
+    if capture and capture.get("p50_ms", 0) > 5:
+        print("  The capture backend is the cause -- check `voltage doctor`. 'portal' "
+              "streams; 'kwin' and 'grim' do a round trip per frame.")
+    else:
+        print("  Capture is cheap, so this is CPU contention -- most likely the model "
+              "servers. Lower reflex_hz to what the machine sustains.")
+    return 1
+
+
 def cmd_stop(args: argparse.Namespace) -> int:
     from .safety import write_panic
 
@@ -656,6 +755,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("doctor", help="check that everything needed for a run works")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser(
+        "reflex",
+        help="measure what reflex rate this machine actually achieves (injects nothing)",
+    )
+    p.add_argument("--hz", type=float, default=20.0, help="rate to ask for (default 20)")
+    p.add_argument("--seconds", type=float, default=5.0, help="how long to run")
+    p.set_defaults(func=cmd_reflex)
 
     p = sub.add_parser("stop", help="emergency stop: halt every running loop")
     p.add_argument("reason", nargs="?", default="manual stop")

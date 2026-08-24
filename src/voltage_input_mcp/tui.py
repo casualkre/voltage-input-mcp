@@ -1046,6 +1046,7 @@ def screen_test(state: dict[str, object]) -> None:
         banner()
         rule("diagnostics")
         print("  [d] doctor        full readiness report")
+        print("  [r] reflex        measure the fast loop's real rate on this machine")
         print("  [c] capture       save a screenshot to screen.png")
         print("  [b] burst         parse a burst string (dry run)")
         print(f"  [k] calibrate     {yellow('moves your real cursor')} -- watch the screen")
@@ -1058,6 +1059,10 @@ def screen_test(state: dict[str, object]) -> None:
             return
         if choice == "d":
             run([venv_bin("voltage"), "doctor"])
+        elif choice == "r":
+            print(dim("\n  Runs the real reflex loop for five seconds against your"))
+            print(dim("  screen. Nothing is injected -- the run is dry.\n"))
+            run([venv_bin("voltage"), "reflex", "--seconds", "5"])
         elif choice == "c":
             run([venv_bin("voltage"), "capture", "-o", "screen.png"])
         elif choice == "b":

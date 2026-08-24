@@ -387,6 +387,7 @@ voltage_steer(dry_run=false)
 
 If anything in this task has timing in it:
 
+- [ ] `voltage reflex` shows the machine holding the rate you are about to assume
 - [ ] Every quantity a fast rule needs is a probe, not a question for the vision model
 - [ ] Anything continuous is a `hold`, not a repeated `do`
 - [ ] Every `hold` has a `release_when` wider than its `when`, or a `min_hold_ms`

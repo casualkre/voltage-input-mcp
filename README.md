@@ -472,6 +472,24 @@ prints what is missing. Then:
 .venv/bin/voltage doctor
 ```
 
+If the task has any timing in it, also check what the fast layer actually achieves here.
+`doctor` predicts a rate from one capture timing; this runs the real loop against your real
+screen for five seconds and reports what happened. It injects nothing.
+
+```bash
+.venv/bin/voltage reflex
+```
+
+```
+  requested       20 Hz
+  measured        19.8 Hz over 99 ticks
+  tick cost       1.80 ms p50, 3.60 ms p95
+  latch events    1  (engaged and released as the guard flipped)
+  starved         0
+
+  OK  the fast layer holds 19.8 Hz here. Reflex and hold rules will react within ~51 ms.
+```
+
 ## Connecting it to a client
 
 ```bash
