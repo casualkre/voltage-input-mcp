@@ -630,6 +630,8 @@ class Session:
             bursts=self._bursts,
             released=released,
             reflex=self.reflex_summary(),
+            recall=self.recall.stats(),
+            tuner=self.tuner_summary(),
             timings=self.timing_summary(),
         )
         self.journal.close()

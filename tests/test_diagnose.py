@@ -169,3 +169,80 @@ def test_missing_lessons_file_is_empty_not_an_error(tmp_path, monkeypatch):
         "voltage_input_mcp.diagnose.lessons_path", lambda: tmp_path / "nope.json"
     )
     assert load_lessons() == []
+
+
+# -- the learning loop -------------------------------------------------------------------
+
+
+def _cycles(n=8):
+    return [
+        {"kind": "cycle", "cycle": i, "t": i * 0.5, "state": "s", "burst": "k:a",
+         "allowed": True, "executed": True, "probes": {"__frame_delta__": 0.3}}
+        for i in range(1, n + 1)
+    ]
+
+
+def test_tunables_without_a_reward_are_reported_as_inert():
+    """The failure mode that looks exactly like learning while nothing moves."""
+    from voltage_input_mcp.diagnose import diagnose
+
+    report = diagnose(
+        _cycles(), {"tunables": {"brake_at": {"default": 90, "min": 40, "max": 200}}}
+    )
+    codes = {f["code"] for f in report["findings"]}
+    assert "tunables_without_reward" in codes
+
+
+def test_a_search_that_is_not_improving_is_called_out():
+    from voltage_input_mcp.diagnose import diagnose
+
+    journal = _cycles()
+    # Reward drifting downwards over twelve episodes.
+    journal += [
+        {"kind": "episode", "index": i, "reward": 100.0 - i * 4, "params": {}}
+        for i in range(1, 13)
+    ]
+    report = diagnose(
+        journal,
+        {"tunables": {"x": {"default": 1, "min": 0, "max": 2}},
+         "reward": {"probe": "money"}},
+    )
+    finding = next(
+        f for f in report["findings"] if f["code"] == "tuning_not_improving"
+    )
+    assert finding["evidence"]["late_mean"] < finding["evidence"]["early_mean"]
+
+
+def test_a_handful_of_episodes_is_reported_as_too_few_rather_than_as_failure():
+    """Calling three noisy episodes a failed search would be reporting luck."""
+    from voltage_input_mcp.diagnose import diagnose
+
+    journal = _cycles() + [
+        {"kind": "episode", "index": i, "reward": 10.0, "params": {}} for i in range(1, 4)
+    ]
+    codes = {
+        f["code"]
+        for f in diagnose(
+            journal,
+            {"tunables": {"x": {"default": 1, "min": 0, "max": 2}},
+             "reward": {"probe": "money"}},
+        )["findings"]
+    }
+    assert "too_few_episodes" in codes
+    assert "tuning_not_improving" not in codes
+
+
+def test_a_recall_cache_that_never_hits_is_diagnosed_with_its_usual_cause():
+    from voltage_input_mcp.diagnose import diagnose
+
+    journal = _cycles()
+    journal.append({
+        "kind": "end", "status": "stopped",
+        "recall": {"enabled": True, "hits": 2, "misses": 90, "hit_rate": 0.022,
+                   "entries": 90},
+    })
+    finding = next(
+        f for f in diagnose(journal, None)["findings"] if f["code"] == "recall_never_hits"
+    )
+    # The fix has to name the actual cause, which is almost always a drifting probe.
+    assert "bucket" in finding["fix"] or "growing" in finding["fix"]

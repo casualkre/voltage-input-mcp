@@ -482,6 +482,71 @@ def _diagnose_fast_layer(
             {"count": stats["render_errors"], "first": sample},
         ))
 
+    # -- the learning loop, if there is one --------------------------------------------
+    end = next((r for r in reversed(journal) if r.get("kind") == "end"), {})
+    episodes = [r for r in journal if r.get("kind") == "episode"]
+    tunables = (playbook or {}).get("tunables") or {}
+    reward = (playbook or {}).get("reward")
+
+    if tunables and not reward:
+        findings.append(Finding(
+            "problem", "tunables_without_reward",
+            f"{len(tunables)} tunables are declared and there is no `reward`.",
+            "Without a reward there is nothing to optimise against, so the search never "
+            "runs and every tunable stays pinned at its default. The playbook looks like "
+            "it is learning and is not.",
+            "Add a `reward` block naming a number probe -- usually a score or money "
+            "counter -- and mark the transition that ends a run `ends_episode: true`.",
+            {"tunables": sorted(tunables)},
+        ))
+    elif tunables and reward and len(episodes) < 6:
+        findings.append(Finding(
+            "hint", "too_few_episodes",
+            f"Only {len(episodes)} scored episodes; the search needs more to say anything.",
+            "A (1+1) search compares a proposal against the incumbent over repeated "
+            "samples, and episode rewards here are noisy enough that a handful of them "
+            "is indistinguishable from luck.",
+            "Run longer. Twenty-plus episodes is where the early-versus-late comparison "
+            "starts to mean something; the run budget is usually what is cutting it "
+            "short.",
+            {"episodes": len(episodes)},
+        ))
+    elif episodes:
+        rewards = [float(e.get("reward", 0.0)) for e in episodes]
+        third = max(1, len(rewards) // 3)
+        early = sum(rewards[:third]) / third
+        late = sum(rewards[-third:]) / third
+        if late <= early:
+            findings.append(Finding(
+                "problem", "tuning_not_improving",
+                f"Episode reward has not improved: {early:.0f} early, {late:.0f} late.",
+                "Either the reward is not measuring what you care about, the tunables are "
+                "not the constants that matter, or their bounds exclude the good region.",
+                "Check the reward probe reads a real number first -- a number probe that "
+                "cannot read returns 0 and makes every episode score identically. Then "
+                "widen the bounds on the tunables you most suspect, and cut the ones you "
+                "do not: every extra dimension costs episodes.",
+                {"early_mean": round(early, 2), "late_mean": round(late, 2),
+                 "episodes": len(episodes)},
+            ))
+
+    recall = end.get("recall") or {}
+    if recall.get("enabled") and recall.get("hit_rate") is not None:
+        rate = float(recall["hit_rate"])
+        if rate < 0.1 and (recall.get("hits", 0) + recall.get("misses", 0)) > 30:
+            findings.append(Finding(
+                "hint", "recall_never_hits",
+                f"Recall answered {rate:.0%} of decisions; it is not paying for itself.",
+                "Situations are not repeating closely enough to be recognised. Usually "
+                "the probe vector contains something that drifts continuously -- a timer, "
+                "a cumulative score -- so no two moments ever look alike.",
+                "Drop continuously-growing probes from the playbook, or bucket them "
+                "(scale a score by 0.001 so only large moves register). Recall keys on "
+                "the declared probes, so what you declare decides what counts as the "
+                "same situation.",
+                {**recall},
+            ))
+
     # -- a number probe that never produced a number -----------------------------------
     ocr = stats.get("ocr") or {}
     if number_probes and ocr and not ocr.get("reads") and ocr.get("misses"):
