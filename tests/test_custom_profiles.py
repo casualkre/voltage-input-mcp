@@ -152,3 +152,41 @@ def test_every_client_produces_steps():
         steps = instructions(client.key, info)
         assert steps, f"{client.key} produced no instructions"
         assert all(isinstance(text, str) and text for text, _ in steps)
+
+
+# -- speculative decoding ----------------------------------------------------------------
+
+
+def test_actuators_speculate_and_vision_models_do_not():
+    """The two roles have opposite n-gram hit rates, so the flag is not global.
+
+    The actuator emits the same burst shapes over and over, with a state's `hint` often
+    containing the exact burst sitting in context to be copied. The vision model describes
+    a fresh image every call -- nothing to copy, and every drafted token is verification
+    work thrown away.
+    """
+    from voltage_input_mcp.llm.profiles import PROFILES
+
+    for name, profile in PROFILES.items():
+        vision = profile.vision.llama_server_args(model_dir="/m")
+        actuator = profile.actuator.llama_server_args(model_dir="/m")
+        assert "--spec-type" not in vision, f"{name}: vision should not speculate"
+        if profile.actuator.speculative:
+            assert "--spec-type" in actuator, f"{name}: actuator should speculate"
+            n_max = actuator[actuator.index("--spec-draft-n-max") + 1]
+            # Measured acceptance by draft position was 72, 49, 49, 14, 14, 14, 6, 6 --
+            # everything past the third is verification cost for almost nothing.
+            assert int(n_max) <= 4, f"{name}: drafting {n_max} deep is mostly waste"
+
+
+def test_speculation_needs_no_draft_model():
+    """The whole reason this is affordable: no second set of weights, so no VRAM.
+
+    A draft model would be the textbook choice and does not fit -- there was 682 MB free
+    on the card this was tuned against.
+    """
+    from voltage_input_mcp.llm.profiles import PROFILES
+
+    args = PROFILES["lean"].actuator.llama_server_args(model_dir="/m")
+    assert "--spec-draft-model" not in args
+    assert "-md" not in args

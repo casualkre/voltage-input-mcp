@@ -82,6 +82,11 @@ class ModelSpec:
     ubatch_size: int = 512
     # CPU threads. Matters for sampling and grammar evaluation even at full GPU offload.
     threads: int = 4
+    # N-gram speculative decoding. On by default for the actuator, off for vision: the
+    # vision model's output is a fresh description of a fresh image, so there is nothing
+    # in context for an n-gram lookup to copy and the verification is pure overhead. The
+    # actuator's output repeats constantly, which is the case it wins.
+    speculative: bool = False
     extra_args: tuple[str, ...] = ()
 
     @property
@@ -152,6 +157,31 @@ class ModelSpec:
             # Expose /metrics so bench.sh can read real prefill/decode timings.
             "--metrics",
         ]
+
+        # N-gram speculative decoding. Free in every sense that matters here: no draft
+        # model, so no VRAM -- which decides it on a 6 GB card with 682 MB spare -- and
+        # mathematically lossless, because the target model verifies every drafted token
+        # and the output distribution is identical to not speculating at all. It is the
+        # only lever in this file that buys latency without trading anything.
+        #
+        # It fits this workload specifically because the output is unusually predictable:
+        # a GBNF grammar bounds every token, bursts repeat across cycles, and a state's
+        # `hint` routinely contains the exact burst we want the model to emit, sitting
+        # right there in the context for an n-gram lookup to copy.
+        #
+        # Measured on Qwen3-1.7B over 33 realistic grammar-constrained cycles:
+        #
+        #     baseline        p50 311 ms   mean 472 ms   p95 1123 ms
+        #     n-max 8         p50 296 ms   mean 392 ms   p95  835 ms   38.8% accepted
+        #     n-max 3         p50 297 ms   mean 375 ms   p95  846 ms   31.8% accepted
+        #
+        # n-max 3 rather than the default because acceptance collapses with depth --
+        # measured per position: 72, 49, 49, 14, 14, 14, 6, 6. Positions beyond the third
+        # contribute almost nothing and every one of them is verification work. The gain
+        # lands in the tail, which is the right place: p95 is what a burst that pads
+        # itself out costs, and the mean is what the loop actually feels.
+        if self.speculative:
+            args += ["--spec-type", "ngram-cache", "--spec-draft-n-max", "3"]
 
         # Persist the prompt cache across restarts. The static prefix is identical every
         # run, so this removes the cold-start penalty on the first cycle after a restart.
@@ -258,6 +288,7 @@ QWEN_VL_7B = ModelSpec(
 
 QWEN3_1_7B = ModelSpec(
     role="actuator",
+    speculative=True,
     label="Qwen3-1.7B",
     hf_repo="unsloth/Qwen3-1.7B-GGUF",
     hf_file="Qwen3-1.7B-Q4_K_M.gguf",
@@ -280,6 +311,7 @@ QWEN3_1_7B = ModelSpec(
 
 QWEN3_4B = ModelSpec(
     role="actuator",
+    speculative=True,
     label="Qwen3-4B-Instruct-2507",
     hf_repo="unsloth/Qwen3-4B-Instruct-2507-GGUF",
     hf_file="Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
@@ -476,6 +508,7 @@ SMOLVLM_500M = ModelSpec(
 
 QWEN3_0_6B = ModelSpec(
     role="actuator",
+    speculative=True,
     label="Qwen3-0.6B",
     hf_repo="unsloth/Qwen3-0.6B-GGUF",
     hf_file="Qwen3-0.6B-Q4_K_M.gguf",
@@ -510,6 +543,7 @@ QWEN_VL_32B = ModelSpec(
 
 QWEN3_14B = ModelSpec(
     role="actuator",
+    speculative=True,
     label="Qwen3-14B",
     hf_repo="unsloth/Qwen3-14B-GGUF",
     hf_file="Qwen3-14B-Q4_K_M.gguf",
@@ -520,6 +554,7 @@ QWEN3_14B = ModelSpec(
 
 QWEN3_30B_A3B = ModelSpec(
     role="actuator",
+    speculative=True,
     label="Qwen3-30B-A3B (MoE)",
     hf_repo="unsloth/Qwen3-30B-A3B-GGUF",
     hf_file="Qwen3-30B-A3B-Q4_K_M.gguf",
