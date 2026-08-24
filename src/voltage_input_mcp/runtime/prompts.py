@@ -94,6 +94,7 @@ def actuator_prompt(
     steer_hint: str | None = None,
     cycles_in_state: int = 0,
     probes: dict[str, float] | None = None,
+    holding: list[str] | None = None,
 ) -> str:
     """The per-cycle text for the actuator.
 
@@ -137,6 +138,15 @@ def actuator_prompt(
                 readings.append(f"{key}={value:g}")
         if readings:
             parts.append("READINGS: " + "  ".join(readings[:8]))
+
+    # What the reflex layer is already doing. Without this the actuator keeps proposing
+    # the movement a latch is holding for it, which at best wastes the burst and at worst
+    # taps the key it is holding down -- a release the latch never asked for.
+    if holding:
+        parts.append(
+            "ALREADY RUNNING: " + ", ".join(holding[:6])
+            + " (reflexes are holding these for you; do not repeat them)"
+        )
 
     if variables:
         rendered = ", ".join(f"{k}={v}" for k, v in list(variables.items())[:8])

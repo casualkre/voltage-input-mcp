@@ -58,6 +58,11 @@ class Config:
     # -- run defaults ----------------------------------------------------------------
     dry_run: bool = True
     target_period_s: float = 0.5
+    # The fast loop: probes, reflexes and latched holds, with no model in the path. This
+    # is a separate number from `target_period_s` on purpose -- it is the one that decides
+    # whether a run can react to anything faster than a decision. 0 disables it and folds
+    # reflexes back into the decision cycle, which is only sensible for pure desktop work.
+    reflex_hz: float = 20.0
     settle_ms: int = 60
     keep_frames: bool = False
     watch_physical_input: bool = True
@@ -79,6 +84,10 @@ class Config:
         if not 0.05 <= self.target_period_s <= 30.0:
             raise ConfigError(
                 f"target_period_s must be between 0.05 and 30, got {self.target_period_s}"
+            )
+        if not 0.0 <= self.reflex_hz <= 120.0:
+            raise ConfigError(
+                f"reflex_hz must be between 0 (off) and 120, got {self.reflex_hz}"
             )
         if self.screen is not None:
             self.screen = (int(self.screen[0]), int(self.screen[1]))

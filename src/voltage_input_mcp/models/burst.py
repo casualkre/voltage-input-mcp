@@ -88,6 +88,7 @@ __all__ = [
     "Wait",
     "Burst",
     "parse_burst",
+    "parse_hold",
     "format_burst",
 ]
 
@@ -518,6 +519,69 @@ def parse_burst(
             raise BurstParseError(f"burst exceeds {MAX_ACTIONS} actions", source=src)
 
     return Burst(actions=tuple(actions), source=src)
+
+
+def parse_hold(src: str) -> tuple[Burst, Burst, tuple[str, ...]]:
+    """Parse a hold spec into `(press, release, names)`.
+
+    A hold spec is a comma-separated list of things to hold down for as long as a
+    condition lasts::
+
+        w                    hold the W key
+        shift, w             hold both
+        btn:r                hold the right mouse button (mouse-look in most games)
+        shift, btn:l         shift-drag, held open across many frames
+
+    Returning bursts rather than raw key codes is the point. It means a latch reaches the
+    device through exactly the same path as everything else -- governor review, verb
+    allowlist, deny_keys, rate limit, held-key bookkeeping, panic release. A latch that
+    tried to hold `leftmeta` is refused for the same reason `k:leftmeta` is, and by the
+    same code, rather than by a second policy check written specially for latches and
+    subtly different from the first.
+
+    Release order is the reverse of press order, so a modifier outlives what it modified.
+    """
+    press: list[Action] = []
+    release: list[Action] = []
+    names: list[str] = []
+    seen: set[str] = set()
+
+    for raw in src.split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if token.startswith("btn:"):
+            button = _button(token[4:])
+            name = f"btn:{button}"
+            if name in seen:
+                raise BurstParseError(f"{name} is held twice in {src!r}", source=src)
+            press.append(ButtonDown(button=button))
+            release.append(ButtonUp(button=button))
+        else:
+            key = _key_name(token)
+            name = key
+            if name in seen:
+                raise BurstParseError(f"{key} is held twice in {src!r}", source=src)
+            press.append(KeyDown(key=key))
+            release.append(KeyUp(key=key))
+        seen.add(name)
+        names.append(name)
+
+    if not press:
+        raise BurstParseError(
+            "hold spec is empty; write something like 'w' or 'shift, btn:r'", source=src
+        )
+    if len(press) > 6:
+        raise BurstParseError(
+            f"a hold spec may cover at most 6 keys or buttons, got {len(press)}", source=src
+        )
+
+    release.reverse()
+    return (
+        Burst(actions=tuple(press), source=format_burst(press)),
+        Burst(actions=tuple(release), source=format_burst(release)),
+        tuple(names),
+    )
 
 
 def format_burst(actions: list[Action]) -> str:

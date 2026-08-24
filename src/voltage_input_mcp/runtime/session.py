@@ -36,21 +36,31 @@ something to say.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Final
 
 from ..capture import CaptureBackend, Frame, ProbeEngine, encode_png
 from ..errors import Aborted, BurstParseError, ExpressionError, SessionError
 from ..expr import GuardContext
 from ..inputs import DeviceSet, ExecutionReport, Executor
+from ..inputs.executor import PointerMode
 from ..llm import Backend, actuator_grammar, observation_grammar
 from ..llm.grammar import vision_vocabulary
 from ..llm.ollama import BURST_SCHEMA, OBSERVATION_SCHEMA
 from ..models.burst import Burst, parse_burst
 from ..models.observation import CoordinateMapper, Observation, parse_vision_output
-from ..models.playbook import TERMINALS, CompiledPlaybook, CompiledState, Perception
+from ..models.playbook import (
+    TERMINALS,
+    CompiledHold,
+    CompiledPlaybook,
+    CompiledReflex,
+    CompiledState,
+    Perception,
+)
+from ..models.template import BurstTemplate
 from ..safety import Governor, KillSwitch, Verdict
 from .journal import CycleRecord, Journal
 from .prompts import ACTUATOR_SYSTEM, VISION_SYSTEM, actuator_prompt, vision_prompt
@@ -82,6 +92,18 @@ class SessionOptions:
     reflex_enabled: bool = True
 
 
+# The reflex loop is the only thing that captures, so it must not be allowed to eat the
+# machine. If a tick costs more than this fraction of the period -- which happens on a
+# non-streaming capture backend where every grab is a 30-40 ms DBus round trip -- it
+# stretches its own period rather than running flat out. The measured rate is reported in
+# `snapshot()`, so what actually happened is visible rather than assumed.
+_REFLEX_DUTY: Final = 0.5
+# How stale a frame the decision loop will accept from the reflex loop before capturing
+# its own. Generous, because the vision call it feeds takes an order of magnitude longer
+# than this.
+_SHARE_MAX_AGE_S: Final = 0.08
+
+
 @dataclass(slots=True)
 class SessionDeps:
     capture: CaptureBackend
@@ -90,6 +112,22 @@ class SessionDeps:
     devices: DeviceSet
     executor: Executor
     screen: tuple[int, int]
+
+
+@dataclass(slots=True)
+class Sample:
+    """One capture plus the probe values measured from it.
+
+    Both loops read this. The reflex loop produces it at reflex rate; the decision loop
+    consumes the latest rather than capturing again. That is not only cheaper -- it is
+    what keeps the two loops agreeing about the screen. When each evaluated probes
+    separately against its own frame, every probe carrying history (`region_diff`, the
+    frame delta, number rates) was being advanced by whichever loop happened to run last.
+    """
+
+    frame: Frame
+    probes: dict[str, float]
+    at: float
 
 
 @dataclass(slots=True)
@@ -123,6 +161,13 @@ class Session:
         self.dry_run = policy.dry_run if self.options.dry_run is None else self.options.dry_run
         deps.executor.dry_run = self.dry_run
         deps.executor.max_hold_ms = policy.max_hold_ms
+        # A playbook may set the pointer mode for its own duration. A game with pointer
+        # lock needs relative motion and desktop UI needs absolute, and requiring a config
+        # edit and a server restart between the two is friction with no purpose. Saved so
+        # the machine goes back to its configured default when the run ends.
+        self._pointer_mode_was = deps.executor.pointer_mode
+        if policy.pointer_mode is not None:
+            deps.executor.pointer_mode = PointerMode(policy.pointer_mode)
 
         self.governor = Governor(
             policy, screen=deps.screen, max_rejections=playbook.spec.budget.max_rejections
@@ -160,14 +205,24 @@ class Session:
         self._grammar_cache: dict[tuple, str] = {}
         self._reflex_task: asyncio.Task[None] | None = None
         self._reflex_fires = 0
-        self._reflex_probes: dict[str, float] = {}
+        self._reflex_starved = 0
+        self._reflex_ticks = 0
+        self._reflex_started_at = 0.0
+        self._reflex_errors: dict[str, str] = {}
         # When an exclusive reflex fires in the fast loop, the next decision is skipped.
         # `exclusive` meant "suppress the actuator this cycle" when reflexes were checked
         # inside the cycle; with them decoupled it has to mean "the reaction already
         # happened, do not let a 300 ms-stale decision override it".
         self._reflex_suppress_until = 0.0
+        # Hold reflexes currently engaged: rule id -> (state it belongs to, engaged at).
+        # Keyed by rule rather than by key so a latch releases exactly what it pressed,
+        # leaving anything a burst or the orchestrator is holding alone.
+        self._latched: dict[str, tuple[str, float]] = {}
+        self._latch_events = 0
+        self._sample: Sample | None = None
+        self._sample_lock = threading.Lock()
         self._timings: dict[str, list[float]] = {"capture": [], "vision": [], "actuator": [],
-                                                 "execute": [], "cycle": []}
+                                                 "execute": [], "cycle": [], "reflex": []}
 
     # -- lifecycle -------------------------------------------------------------------
 
@@ -233,79 +288,233 @@ class Session:
             await self._cleanup()
 
     async def _reflex_loop(self) -> None:
-        """Capture, probe and fire reflexes at `reflex_hz`, independent of decisions.
+        """Capture, probe, hold and react at `reflex_hz`, independent of decisions.
 
         Deliberately does not touch the vision model or the actuator. It captures a
-        frame, evaluates the probes -- which for a number probe means reading a cached
-        value, not paying for OCR -- and fires any reflex whose guard holds. That path is
-        a couple of milliseconds end to end, so it can run at 20-30 Hz while the decision
-        loop plods along at 2 Hz underneath it.
+        frame, evaluates the probes -- which for a number probe means reading the last
+        value a background worker produced, not paying for OCR -- then updates every
+        latch and fires at most one one-shot reflex. That path is a couple of
+        milliseconds end to end, so it can run at 20-30 Hz while the decision loop plods
+        along at 2 Hz underneath it.
 
         This is where the responsiveness the small models were chosen for actually lives.
-        A decision loop cannot dodge; a reflex can.
+        A decision loop cannot dodge; a reflex can. A decision loop cannot hold a key
+        down for exactly as long as a condition lasts; a latch can.
+
+        The pacing is duty-limited rather than fixed. On a streaming capture backend a
+        tick is ~2 ms and the configured rate is met exactly. On a backend where every
+        grab is a DBus round trip, insisting on 20 Hz would spend the machine on capture
+        and starve the two model servers, so the loop stretches its own period instead
+        and reports the rate it actually achieved.
         """
         period = 1.0 / max(1.0, self.options.reflex_hz)
+        self._reflex_started_at = time.monotonic()
         while self.status in ("running", "paused"):
             started = time.perf_counter()
             try:
                 if self.status == "running" and not self.killswitch.tripped:
                     await self._reflex_tick()
+                    self._reflex_ticks += 1
             except asyncio.CancelledError:
                 return
-            except Exception:  # noqa: BLE001 - a reflex must never kill the run
-                pass
-            remaining = period - (time.perf_counter() - started)
-            await asyncio.sleep(max(0.002, remaining))
+            except Exception as exc:  # noqa: BLE001 - a reflex must never kill the run
+                self._note_reflex_error("tick", exc)
+            elapsed = time.perf_counter() - started
+            self._timings["reflex"].append(elapsed * 1000.0)
+            await asyncio.sleep(
+                max(0.002, period - elapsed, elapsed * (1.0 / _REFLEX_DUTY - 1.0))
+            )
 
     async def _reflex_tick(self) -> None:
         state = self.playbook.states.get(self.state_name)
-        if state is None or not state.reflexes:
+        if state is None:
+            return
+        # Capture even with no rules in this state: the decision loop reads these samples,
+        # and probe history has to keep advancing or `region_diff` and the number rates
+        # measure across whatever gap the last rule-bearing state left behind.
+        sample = await asyncio.to_thread(self._sample_fresh, 0.0)
+        if not state.reflexes and not state.holds:
             return
 
-        frame = await asyncio.to_thread(self.deps.capture.grab, None)
-        probes = await asyncio.to_thread(self.probes.evaluate, frame)
-        self._reflex_probes = probes
-
-        ctx = GuardContext(
-            elements=[
-                {"label": e.label, "conf": e.conf} for e in self._last_observation.elements
-            ],
-            texts=list(self._last_observation.texts),
-            flags=set(self._last_observation.flags),
-            scene=self._last_observation.scene,
-            probes=dict(probes),
-            vars=self.vars,
-            state={
-                "name": self.state_name,
-                "cycles": self._cycles_in_state,
-                "elapsed": time.monotonic() - self._state_entered_at,
-            },
-            run={"cycles": self._cycle, "elapsed": time.monotonic() - self._started_at},
-        )
+        ctx = self._context_from(sample.probes)
+        await self._update_latches(state, ctx)
 
         picked = self._pick_reflex(state, ctx)
         if picked is None:
             return
-        _guard, burst, rule = picked
+
+        try:
+            burst = picked.template.burst(ctx, screen=self.deps.screen)
+        except (BurstParseError, ExpressionError) as exc:
+            self._note_reflex_error(picked.rule.id, exc)
+            self.journal.event(
+                "reflex_error", rule=picked.rule.id, source=picked.template.source,
+                error=str(exc),
+            )
+            return
+        if not burst.actions:
+            return
 
         verdict = self.governor.review(
             burst, observation=self._last_observation,
-            allow_verbs=state.allow_verbs, source=f"reflex:{rule.id}",
+            allow_verbs=state.allow_verbs, source=f"reflex:{picked.rule.id}",
         )
-        if not verdict.allowed or not burst.actions:
+        if not verdict.allowed:
             return
 
-        self._rule_fired[rule.id] = (
-            time.monotonic(), self._rule_fired.get(rule.id, (0.0, 0))[1] + 1
+        # Give up rather than queue. See Executor.run: a reflex that lands after the
+        # burst it queued behind is a reaction applied to a situation that has moved on.
+        report = await asyncio.to_thread(
+            self.deps.executor.run,
+            burst,
+            label=f"reflex:{picked.rule.id}",
+            wait_s=min(0.05, 1.0 / max(1.0, self.options.reflex_hz) * 0.5),
+        )
+        if report.error and report.error.startswith("input busy"):
+            self._reflex_starved += 1
+            self.journal.event("reflex_starved", rule=picked.rule.id, burst=burst.render())
+            return
+
+        self._rule_fired[picked.rule.id] = (
+            time.monotonic(), self._rule_fired.get(picked.rule.id, (0.0, 0))[1] + 1
         )
         self._reflex_fires += 1
-        if rule.exclusive:
+        if picked.rule.exclusive:
             self._reflex_suppress_until = time.monotonic() + self.options.target_period_s
-        await asyncio.to_thread(self.deps.executor.run, burst, label=f"reflex:{rule.id}")
         self.journal.event(
-            "reflex", rule=rule.id, burst=burst.render(),
-            probes={k: round(v, 3) for k, v in probes.items() if not k.startswith("__")},
+            "reflex", rule=picked.rule.id, burst=burst.render(),
+            probes={
+                k: round(v, 3) for k, v in sample.probes.items() if not k.startswith("__")
+            },
         )
+
+    # -- latches ---------------------------------------------------------------------
+
+    async def _update_latches(self, state: CompiledState, ctx: GuardContext) -> None:
+        """Bring every hold reflex's key state into line with its guard.
+
+        Runs before one-shot reflexes so that a `do` rule guarded on `held('w')` sees this
+        tick's latch state rather than last tick's.
+        """
+        for hold in state.holds:
+            rule = hold.rule
+            engaged = rule.id in self._latched
+
+            if not engaged:
+                fires = self._rule_fired.get(rule.id, (0.0, 0))[1]
+                if rule.max_fires is not None and fires >= rule.max_fires:
+                    continue
+                if self._test(hold.guard, ctx, f"{state.name}.hold.{rule.id}"):
+                    await self._engage(hold, state)
+                continue
+
+            _, since = self._latched[rule.id]
+            if (time.monotonic() - since) * 1000.0 < rule.min_hold_ms:
+                continue
+            if hold.release is not None:
+                # An explicit release condition, so there is a dead band between the two
+                # thresholds in which neither fires and the latch simply keeps its state.
+                # That band is the whole point -- it is what stops the key chattering.
+                let_go = self._test(hold.release, ctx, f"{state.name}.hold.{rule.id}.release")
+            else:
+                let_go = not self._test(hold.guard, ctx, f"{state.name}.hold.{rule.id}")
+            if let_go:
+                await self._disengage(hold)
+
+    async def _engage(self, hold: CompiledHold, state: CompiledState) -> None:
+        verdict = self.governor.review(
+            hold.press, observation=self._last_observation,
+            allow_verbs=state.allow_verbs, source=f"hold:{hold.rule.id}",
+        )
+        if not verdict.allowed:
+            self.journal.event(
+                "hold_refused", rule=hold.rule.id, burst=hold.press.render(),
+                **verdict.as_dict(),
+            )
+            return
+        report = await asyncio.to_thread(
+            self.deps.executor.run, hold.press, label=f"hold:{hold.rule.id}", wait_s=0.05
+        )
+        if not report.ok:
+            # Never record a latch as engaged unless the press actually landed, or the
+            # release will be skipped as redundant and the key state stops tracking the
+            # guard in the one direction that matters.
+            if report.error and report.error.startswith("input busy"):
+                self._reflex_starved += 1
+            return
+        self._latched[hold.rule.id] = (state.name, time.monotonic())
+        self.deps.executor.supervise(hold.names)
+        self._latch_events += 1
+        self._rule_fired[hold.rule.id] = (
+            time.monotonic(), self._rule_fired.get(hold.rule.id, (0.0, 0))[1] + 1
+        )
+        self.journal.event("hold_on", rule=hold.rule.id, holding=list(hold.names))
+
+    async def _disengage(self, hold: CompiledHold) -> None:
+        self._latched.pop(hold.rule.id, None)
+        self.deps.executor.unsupervise(hold.names)
+        self._latch_events += 1
+        # No governor review and no timeout. Letting go is safe by construction, and a
+        # release that gets refused by a rate limit or dropped because the device was
+        # busy is a key left down on the user's desktop.
+        await asyncio.to_thread(
+            self.deps.executor.run, hold.release_burst, label=f"hold:{hold.rule.id}:off"
+        )
+        self.journal.event("hold_off", rule=hold.rule.id, holding=list(hold.names))
+
+    async def _release_latches(self, *, state: str | None = None, why: str = "") -> None:
+        """Let go of every latch, or only those belonging to one state.
+
+        Called on state exit, pause and shutdown. Scoped by state so a hold cannot outlive
+        the state whose guard was driving it -- once the guard is no longer being
+        evaluated, nothing would ever release the key.
+        """
+        for rule_id, (owner, _) in list(self._latched.items()):
+            if state is not None and owner != state:
+                continue
+            hold = self._find_hold(owner, rule_id)
+            self._latched.pop(rule_id, None)
+            if hold is None:
+                continue
+            self.deps.executor.unsupervise(hold.names)
+            await asyncio.to_thread(
+                self.deps.executor.run, hold.release_burst, label=f"hold:{rule_id}:off"
+            )
+            self.journal.event("hold_off", rule=rule_id, holding=list(hold.names), why=why)
+
+    def _find_hold(self, state_name: str, rule_id: str) -> CompiledHold | None:
+        state = self.playbook.states.get(state_name)
+        if state is None:
+            return None
+        return next((h for h in state.holds if h.rule.id == rule_id), None)
+
+    def _note_reflex_error(self, where: str, exc: Exception) -> None:
+        """Keep the first error per site, so `status` can show it without a log flood."""
+        self._reflex_errors.setdefault(where, f"{type(exc).__name__}: {exc}")
+
+    # -- sampling --------------------------------------------------------------------
+
+    def _sample_fresh(self, max_age_s: float) -> Sample:
+        """The latest capture and probe values, taking a new one if the last is stale.
+
+        Runs on a worker thread from both loops, hence the lock: two threads finding the
+        sample stale at the same moment would otherwise both capture, and the probe
+        engine would advance its history twice for one instant in time.
+        """
+        sample = self._sample
+        if sample is not None and (time.monotonic() - sample.at) <= max_age_s:
+            return sample
+        with self._sample_lock:
+            sample = self._sample
+            if sample is not None and (time.monotonic() - sample.at) <= max_age_s:
+                return sample
+            t0 = time.perf_counter()
+            frame = self.deps.capture.grab(None)
+            self._timings["capture"].append((time.perf_counter() - t0) * 1000.0)
+            probes = self.probes.evaluate(frame)
+            sample = Sample(frame=frame, probes=probes, at=time.monotonic())
+            self._sample = sample
+            return sample
 
     async def _cleanup(self) -> None:
         if self._reflex_task is not None:
@@ -315,8 +524,11 @@ class Session:
             self._pending.cancel()
             self._pending = None
         # Releasing held input is the one cleanup step that must never be skipped.
+        self._latched.clear()
         released = await asyncio.to_thread(self.deps.executor.release_all)
+        self.deps.executor.pointer_mode = self._pointer_mode_was
         self.killswitch.stop()
+        self.probes.close()
         self.journal.event(
             "end",
             status=self.status,
@@ -324,6 +536,7 @@ class Session:
             cycles=self._cycle,
             bursts=self._bursts,
             released=released,
+            reflex=self.reflex_summary(),
             timings=self.timing_summary(),
         )
         self.journal.close()
@@ -378,24 +591,35 @@ class Session:
             self._finish("failed", "failure_when matched")
             return False
 
-        # 2. Reflexes -- only when the fast loop is off. With it on, reflexes fire there
-        # at reflex_hz instead, and firing here as well would double every reaction.
+        # 2. Reflexes and latches -- only when the fast loop is off. With it on, both run
+        # there at reflex_hz, and doing them here as well would double every reaction.
+        if not self.options.reflex_enabled:
+            await self._update_latches(state, ctx)
         reflex = None if self.options.reflex_enabled else self._pick_reflex(state, ctx)
         if reflex is not None:
-            guard, burst, rule = reflex
+            rule = reflex.rule
             record.burst_source = f"reflex:{rule.id}"
-            record.burst = burst.render()
-            report, verdict = await self._guarded_execute(
-                burst, percept.observation, state, source=record.burst_source
-            )
-            record.allowed = verdict.allowed
-            record.violations = [v.as_dict() for v in verdict.violations]
-            record.executed = bool(report and report.ok and not self.dry_run)
-            self._rule_fired[rule.id] = (time.monotonic(), self._rule_fired.get(rule.id, (0, 0))[1] + 1)
-            if rule.exclusive:
-                record.note = "reflex fired exclusively; actuator skipped this cycle"
-                self._finalise_cycle(record, cycle_start)
-                return True
+            try:
+                burst = reflex.template.burst(ctx, screen=self.deps.screen)
+            except (BurstParseError, ExpressionError) as exc:
+                record.error = f"reflex {rule.id} did not render: {exc}"
+                burst = None
+            if burst is not None:
+                record.burst = burst.render()
+                report, verdict = await self._guarded_execute(
+                    burst, percept.observation, state, source=record.burst_source
+                )
+                record.allowed = verdict.allowed
+                record.violations = [v.as_dict() for v in verdict.violations]
+                record.executed = bool(report and report.ok and not self.dry_run)
+                self._reflex_fires += 1
+                self._rule_fired[rule.id] = (
+                    time.monotonic(), self._rule_fired.get(rule.id, (0.0, 0))[1] + 1
+                )
+                if rule.exclusive:
+                    record.note = "reflex fired exclusively; actuator skipped this cycle"
+                    self._finalise_cycle(record, cycle_start)
+                    return True
 
         # 3. Transitions: the orchestrator's control flow outranks the actuator.
         moved = await self._maybe_transition(state, ctx, record)
@@ -456,18 +680,23 @@ class Session:
 
         t0 = time.perf_counter()
         try:
-            region = settings.region.as_tuple() if settings.region else None
-            frame = await asyncio.to_thread(self.deps.capture.grab, region)
+            # Reuse the reflex loop's capture when it is recent enough. The frame this
+            # feeds is about to sit in front of a model for several hundred milliseconds,
+            # so paying for a second grab to make it 30 ms fresher buys nothing.
+            sample = await asyncio.to_thread(self._sample_fresh, _SHARE_MAX_AGE_S)
         except Exception as exc:  # noqa: BLE001
             result.error = f"capture failed: {exc}"
             result.observation = self._last_observation
             result.source = "cache"
             return result
         result.capture_ms = (time.perf_counter() - t0) * 1000.0
-        self._timings["capture"].append(result.capture_ms)
-        result.frame = frame
+        result.probes = sample.probes
 
-        result.probes = await asyncio.to_thread(self.probes.evaluate, frame)
+        frame = sample.frame
+        if settings.region is not None:
+            x, y, w, h = settings.region.as_tuple()
+            frame = frame.crop(x - frame.origin[0], y - frame.origin[1], w, h)
+        result.frame = frame
 
         if not self._should_run_vision(settings, result.probes):
             result.observation = self._last_observation
@@ -485,6 +714,10 @@ class Session:
             result.error = "vision backend failed; reusing the last observation"
             return result
 
+        # Only a successful look resets the change baseline. Moving it on a failed call
+        # would have the loop conclude the screen is unchanged relative to an observation
+        # that was never made, and `on_change` would then skip vision indefinitely.
+        self.probes.mark_perceived(sample.frame)
         self._last_observation = observation
         result.observation = observation
         result.source = "vlm"
@@ -501,8 +734,10 @@ class Session:
             return True
         if settings.mode == "cadence":
             return self._cycle % settings.cadence == 0
-        # on_change
-        return probes.get("__frame_delta__", 1.0) >= settings.change_threshold
+        # on_change. Measured against the frame vision last saw, not against the previous
+        # frame: with the reflex loop sampling at 20 Hz, "changed since the last frame"
+        # answers a question about the last 50 ms, which is not what this gate is for.
+        return probes.get("__delta_vs_vision__", 1.0) >= settings.change_threshold
 
     async def _run_vision(
         self, state: CompiledState, frame: Frame, settings: Perception
@@ -590,7 +825,8 @@ class Session:
             last_result=self._last_result,
             steer_hint=self._steer_hint,
             cycles_in_state=self._cycles_in_state,
-            probes=percept.probes or self._reflex_probes,
+            probes=percept.probes or self.probes.last,
+            holding=sorted(self._latched),
         )
 
         t0 = time.perf_counter()
@@ -726,10 +962,13 @@ class Session:
         return None
 
     async def _goto(self, target: str, current: CompiledState, record: CycleRecord) -> None:
+        # Latches go first, before on_exit and before the state changes. A hold is driven
+        # by a guard that is about to stop being evaluated, so anything still down would
+        # stay down with nothing left to release it.
+        await self._release_latches(state=current.name, why=f"leaving {current.name}")
+
         if current.on_exit:
-            await self._guarded_execute(
-                current.on_exit, self._last_observation, current, source="on_exit"
-            )
+            await self._run_template(current.on_exit, current, source="on_exit")
 
         if target == "@success":
             self._finish("succeeded", f"reached @success from {current.name}")
@@ -753,9 +992,27 @@ class Session:
         self.journal.event("state", name=name, brief=state.spec.brief, first=first)
 
         if state.on_enter:
-            await self._guarded_execute(
-                state.on_enter, self._last_observation, state, source="on_enter"
+            await self._run_template(state.on_enter, state, source="on_enter")
+
+    async def _run_template(
+        self, template: BurstTemplate, state: CompiledState, *, source: str
+    ) -> None:
+        """Render a playbook-authored burst against the live context, then execute it.
+
+        Rendering can fail at runtime in a way the compile-time check cannot catch -- a
+        steering expression that overshoots produces an off-screen move. That is
+        journalled with the rendered text, which is the thing the author needs to see,
+        and the hook is skipped rather than the run being killed over it.
+        """
+        ctx = self._context_from(self.probes.last)
+        try:
+            burst = template.burst(ctx, screen=self.deps.screen)
+        except (BurstParseError, ExpressionError) as exc:
+            self.journal.event(
+                "burst_error", source=source, template=template.source, error=str(exc)
             )
+            return
+        await self._guarded_execute(burst, self._last_observation, state, source=source)
 
     def _state_limit(self, state: CompiledState) -> str | None:
         if state.spec.max_cycles and self._cycles_in_state >= state.spec.max_cycles:
@@ -768,32 +1025,48 @@ class Session:
 
     # -- reflexes --------------------------------------------------------------------
 
-    def _pick_reflex(self, state: CompiledState, ctx: GuardContext):
+    def _pick_reflex(self, state: CompiledState, ctx: GuardContext) -> CompiledReflex | None:
         now = time.monotonic()
-        for guard, burst, rule in state.reflexes:  # already sorted by priority
+        for reflex in state.reflexes:  # already sorted by priority
+            rule = reflex.rule
             last, count = self._rule_fired.get(rule.id, (0.0, 0))
             if rule.max_fires is not None and count >= rule.max_fires:
                 continue
             if last and (now - last) * 1000.0 < rule.cooldown_ms:
                 continue
-            if self._test(guard, ctx, f"{state.name}.reflex.{rule.id}"):
-                return guard, burst, rule
+            if self._test(reflex.guard, ctx, f"{state.name}.reflex.{rule.id}"):
+                return reflex
         return None
 
     # -- guards ----------------------------------------------------------------------
 
     def _context(self, percept: Perceived) -> GuardContext:
-        observation = percept.observation
+        return self._context_from(percept.probes, observation=percept.observation)
+
+    def _context_from(
+        self, probes: dict[str, float], *, observation: Observation | None = None
+    ) -> GuardContext:
+        """Build a guard context.
+
+        The reflex loop passes no observation and gets the last one the vision model
+        produced, which is correct: a reflex must never wait for fresh vision, and the
+        cached labels are the best information available at reflex rate. What it does get
+        fresh is the probes, `held` and `latched` -- everything a fast rule should be
+        keying off.
+        """
+        obs = self._last_observation if observation is None else observation
         return GuardContext(
             elements=[
                 {"label": e.label, "conf": e.conf, "box": [e.x, e.y, e.w, e.h]}
-                for e in observation.elements
+                for e in obs.elements
             ],
-            texts=list(observation.texts),
-            flags=set(observation.flags),
-            scene=observation.scene,
-            probes=dict(percept.probes),
+            texts=list(obs.texts),
+            flags=set(obs.flags),
+            scene=obs.scene,
+            probes=dict(probes),
             vars=self.vars,
+            held=self.deps.executor.held_names(),
+            latched=set(self._latched),
             state={
                 "name": self.state_name,
                 "cycles": self._cycles_in_state,
@@ -803,8 +1076,8 @@ class Session:
                 "cycles": self._cycle,
                 "elapsed": time.monotonic() - self._started_at,
                 "bursts": self._bursts,
-            "reflex_fires": self._reflex_fires,
-            "reflex_hz": self.options.reflex_hz if self.options.reflex_enabled else 0,
+                "reflex_fires": self._reflex_fires,
+                "reflex_hz": self.measured_reflex_hz(),
                 "rejections": self.governor.rejections,
                 "last_burst_ok": self._last_result in ("ok", ""),
             },
@@ -878,7 +1151,12 @@ class Session:
     def pause(self) -> None:
         self._pause.clear()
         self.status = "paused"
-        self.journal.event("pause")
+        # A latch pressed against a guard that is no longer being evaluated stays down
+        # for the whole pause. Nothing about "hold W while descending" implies "keep W
+        # down while a human inspects the screen".
+        released = self.deps.executor.release_all()
+        self._latched.clear()
+        self.journal.event("pause", released=released)
 
     def resume(self) -> None:
         self._pause.set()
@@ -899,6 +1177,32 @@ class Session:
         self.deps.executor.clear_abort()
 
     # -- reporting -------------------------------------------------------------------
+
+    def measured_reflex_hz(self) -> float:
+        """The rate the reflex loop actually achieved, not the one it was asked for.
+
+        The configured number is an upper bound that a slow capture backend will not
+        reach, and reporting the request instead of the result is precisely the kind of
+        claim that makes a design look like it is working when it is not.
+        """
+        if not self.options.reflex_enabled or not self._reflex_started_at:
+            return 0.0
+        elapsed = time.monotonic() - self._reflex_started_at
+        return round(self._reflex_ticks / elapsed, 1) if elapsed > 0.2 else 0.0
+
+    def reflex_summary(self) -> dict[str, Any]:
+        return {
+            "enabled": self.options.reflex_enabled,
+            "requested_hz": self.options.reflex_hz if self.options.reflex_enabled else 0,
+            "measured_hz": self.measured_reflex_hz(),
+            "ticks": self._reflex_ticks,
+            "fires": self._reflex_fires,
+            "starved": self._reflex_starved,
+            "latch_events": self._latch_events,
+            "latched_now": sorted(self._latched),
+            "ocr": self.probes.ocr_stats(),
+            "errors": dict(self._reflex_errors),
+        }
 
     def timing_summary(self) -> dict[str, dict[str, float]]:
         out: dict[str, dict[str, float]] = {}
@@ -926,8 +1230,8 @@ class Session:
             "cycles": self._cycle,
             "cycles_in_state": self._cycles_in_state,
             "bursts": self._bursts,
-            "reflex_fires": self._reflex_fires,
-            "reflex_hz": self.options.reflex_hz if self.options.reflex_enabled else 0,
+            "reflex": self.reflex_summary(),
+            "held": sorted(self.deps.executor.held_names()),
             "elapsed_s": round(elapsed, 1),
             "vars": dict(self.vars),
             "last_burst": self._last_burst,

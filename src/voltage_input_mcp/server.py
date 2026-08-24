@@ -42,14 +42,25 @@ def _instructions() -> str:
     cheaper than a tool call it may not think to make.
     """
     base = (
-        "Two-layer input engine. You are the orchestrator: you write a Playbook -- a "
-        "state machine with guards, limits and a safety policy -- and two small local "
-        "models execute it, one reading the screen and one emitting timed input bursts.\n"
+        "Three-layer input engine. You are the orchestrator: you write a Playbook -- a "
+        "state machine with probes, guards, limits and a safety policy -- and it is run "
+        "by two small local models plus a model-free fast loop.\n"
         "\n"
-        "Start with voltage_reference(section='loop') for the iteration loop, and "
-        "section='bursts' for how to chain inputs well. voltage_doctor confirms the "
-        "machine is ready. After a run that did not do what you wanted, call "
-        "voltage_diagnose rather than reading the journal by hand.\n"
+        "  decision  ~2 Hz. The two models: one reads the screen, one emits a burst.\n"
+        "  burst     ms precision. One decision produces many timed inputs.\n"
+        "  reflex    ~20 Hz. Guards over probes, evaluated with no model in the path.\n"
+        "            Latched `hold` rules keep a key down for exactly as long as a "
+        "condition lasts.\n"
+        "\n"
+        "Driving this from the decision layer alone gets you 2 Hz and no reactions "
+        "between decisions. If your playbook declares no probes and no reflexes, you are "
+        "using a remote keyboard with extra steps -- read "
+        "voltage_reference(section='control') first.\n"
+        "\n"
+        "Then voltage_reference(section='loop') for the iteration loop and "
+        "section='bursts' for chaining inputs well. voltage_doctor confirms the machine "
+        "is ready. After a run that did not do what you wanted, call voltage_diagnose "
+        "rather than reading the journal by hand.\n"
         "\n"
         "The local models are small and take instructions literally. Give each state a "
         "short imperative brief, a closed list of things to look for, and explicit "
@@ -102,7 +113,7 @@ async def voltage_doctor() -> dict[str, Any]:
 @server.tool(annotations=READ_ONLY)
 async def voltage_reference(
     section: Literal[
-        "all", "burst", "bursts", "playbook", "guards", "example", "loop"
+        "all", "burst", "bursts", "control", "playbook", "guards", "example", "loop"
     ] = "all",
 ) -> dict[str, Any]:
     """Return everything needed to author and iterate on a run.
@@ -111,6 +122,9 @@ async def voltage_reference(
 
       loop      **the learning loop** -- how to go from a failed run to a working one,
                 and what each failure mode actually means. Read this second.
+      control   **continuous control** -- probes, latched holds and interpolated bursts:
+                the layer that runs at ~20 Hz between decisions. Read this before
+                driving anything with timing in it, including any game.
       bursts    the burst cookbook: how to chain inputs well, timing rules, ready-made
                 patterns for desktop and for games, and the antipatterns that waste
                 cycles. Read this if bursts are coming out one action at a time.
@@ -123,6 +137,7 @@ async def voltage_reference(
     from .reference import (
         BURST_COOKBOOK,
         BURST_REFERENCE,
+        CONTINUOUS_CONTROL,
         EXAMPLE_PLAYBOOK,
         GUARD_REFERENCE,
         LEARNING_LOOP,
@@ -133,6 +148,8 @@ async def voltage_reference(
     out: dict[str, Any] = {"ok": True, "active_build": active_build()}
     if section in ("all", "loop"):
         out["learning_loop"] = LEARNING_LOOP
+    if section in ("all", "control"):
+        out["continuous_control"] = CONTINUOUS_CONTROL
     if section in ("all", "bursts"):
         out["burst_cookbook"] = BURST_COOKBOOK
     if section in ("all", "burst"):
@@ -409,6 +426,7 @@ async def voltage_run(
     playbook: dict[str, Any],
     dry_run: bool | None = None,
     target_period_s: float | None = None,
+    reflex_hz: float | None = None,
     keep_frames: bool = False,
 ) -> dict[str, Any]:
     """Start a Playbook. Returns immediately with a run_id; poll voltage_status.
@@ -418,8 +436,14 @@ async def voltage_run(
     it is the correct way to check that your states, guards and transitions behave before
     letting it touch the machine.
 
-    `target_period_s` is the loop period. 0.5 is a good default; lower it for games,
-    raise it for slow UI.
+    `target_period_s` is the *decision* period -- how often the two models are asked.
+    0.5 is a good default; lower it for games, raise it for slow UI.
+
+    `reflex_hz` is the rate of the fast loop that evaluates probes, fires reflexes and
+    updates latched holds with no model in the path. Default 20. This is the number that
+    decides whether the run can react to anything faster than half a second, and it is
+    independent of `target_period_s`. A slow capture backend will not reach the rate you
+    ask for; `voltage_status` reports what was measured, not what was requested.
 
     Stop a run with voltage_stop, adjust it live with voltage_steer. The run also stops
     on its own budget, on any physical keyboard or mouse input from the user, and on the
@@ -433,7 +457,9 @@ async def voltage_run(
 
     try:
         options = app.session_options(
-            target_period_s=target_period_s, keep_frames=keep_frames or None
+            target_period_s=target_period_s,
+            reflex_hz=reflex_hz,
+            keep_frames=keep_frames or None,
         )
         options.dry_run = dry_run
         session = Session(compiled, app.session_deps(), options)
@@ -447,11 +473,35 @@ async def voltage_run(
             "dry_run": session.dry_run,
             "state": session.state_name,
             "warnings": compiled.warnings,
+            "advice": _fast_layer_advice(compiled),
             "journal": str(session.journal.path),
             "next": "poll voltage_status(run_id) to watch it, voltage_stop to end it",
         }
     except Exception as exc:  # noqa: BLE001
         return _error(exc)
+
+
+def _fast_layer_advice(compiled: Any) -> list[str]:
+    """Say up front when a playbook is about to run entirely at decision rate.
+
+    Cheaper than letting the run finish and diagnosing it afterwards, and it lands at the
+    moment the orchestrator is still holding the playbook in mind.
+    """
+    notes: list[str] = []
+    holds = sum(len(s.holds) for s in compiled.states.values())
+    reflexes = sum(len(s.reflexes) for s in compiled.states.values())
+    if not compiled.spec.probes:
+        notes.append(
+            "No probes declared, so nothing can be measured between decisions and every "
+            "guard depends on the vision model. For anything with timing in it, add a "
+            "probe -- see voltage_reference(section='control')."
+        )
+    if not reflexes and not holds:
+        notes.append(
+            "No reflexes and no holds, so every input waits on a model decision (~2 Hz). "
+            "Bursts still batch inputs within a decision, but nothing reacts between them."
+        )
+    return notes
 
 
 @server.tool(annotations=READ_ONLY)

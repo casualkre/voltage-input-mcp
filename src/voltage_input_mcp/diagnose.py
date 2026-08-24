@@ -247,6 +247,8 @@ def diagnose(
             {"vlm_cycles": perception.get("vlm", 0), "total": n},
         ))
 
+    findings.extend(_diagnose_fast_layer(journal, playbook, cycles))
+
     order = {s: i for i, s in enumerate(SEVERITY)}
     findings.sort(key=lambda f: order.get(f.severity, 9))
 
@@ -259,12 +261,189 @@ def diagnose(
         "transitions": len(transitions),
         "states_visited": dict(states),
         "perception": dict(perception),
+        "reflex": _reflex_stats(journal),
         "findings": [f.as_dict() for f in findings],
         "summary": (
             findings[0].what if findings
             else f"{n} cycles, {len(executed)} bursts executed, no problems detected."
         ),
     }
+
+
+def _reflex_stats(journal: list[dict[str, Any]]) -> dict[str, Any]:
+    """What the fast layer did, from its own events plus the end-of-run summary."""
+    kinds = Counter(str(r.get("kind", "")) for r in journal)
+    end = next((r for r in reversed(journal) if r.get("kind") == "end"), {})
+    summary = end.get("reflex") or {}
+    return {
+        "fires": kinds.get("reflex", 0),
+        "starved": kinds.get("reflex_starved", 0),
+        "render_errors": kinds.get("reflex_error", 0) + kinds.get("burst_error", 0),
+        "hold_on": kinds.get("hold_on", 0),
+        "hold_off": kinds.get("hold_off", 0),
+        "hold_refused": kinds.get("hold_refused", 0),
+        "measured_hz": summary.get("measured_hz"),
+        "requested_hz": summary.get("requested_hz"),
+        "ticks": summary.get("ticks"),
+        "ocr": summary.get("ocr") or {},
+    }
+
+
+def _diagnose_fast_layer(
+    journal: list[dict[str, Any]],
+    playbook: dict[str, Any] | None,
+    cycles: list[dict[str, Any]],
+) -> list[Finding]:
+    """Findings about the reflex loop -- the part that runs between decisions.
+
+    This is where a run silently degrades into the thing it was built not to be. Every
+    check here distinguishes "the fast layer did its job" from "the fast layer was
+    configured but never actually did anything", because those look identical in a
+    summary and the second one means the whole run happened at decision rate.
+    """
+    findings: list[Finding] = []
+    stats = _reflex_stats(journal)
+    elapsed = float(cycles[-1].get("t", 0.0)) - float(cycles[0].get("t", 0.0)) if cycles else 0.0
+
+    declared_reflexes = 0
+    declared_holds = 0
+    declared_probes = 0
+    number_probes: list[str] = []
+    if playbook:
+        for spec in playbook.get("probes") or []:
+            declared_probes += 1
+            if isinstance(spec, dict) and spec.get("type") == "number":
+                number_probes.append(str(spec.get("id", "?")))
+        for state in (playbook.get("states") or {}).values():
+            for rule in state.get("reflex") or []:
+                if rule.get("hold"):
+                    declared_holds += 1
+                else:
+                    declared_reflexes += 1
+
+    # -- the fast layer is not being used at all ---------------------------------------
+    if playbook and not declared_reflexes and not declared_holds:
+        findings.append(Finding(
+            "problem", "no_fast_layer",
+            "This playbook declares no reflexes and no holds.",
+            "Every input therefore waited on a model decision, so the effective input "
+            "rate was the decision rate -- around 2 Hz. Bursts help within a decision, "
+            "but nothing reacted between them. For anything with timing in it, that is "
+            "the difference between controlling and hoping.",
+            "Add a probe over the number or colour that matters, then a reflex keyed off "
+            "it. Use `hold` for anything continuous ('hold w while the target is ahead') "
+            "and `do` for discrete reactions. See voltage_reference(section='control').",
+            {"probes": declared_probes},
+        ))
+
+    # -- declared but never triggered --------------------------------------------------
+    if (declared_reflexes or declared_holds) and not stats["fires"] and not stats["hold_on"]:
+        probe_seen: dict[str, float] = {}
+        for cycle in cycles:
+            for key, value in (cycle.get("probes") or {}).items():
+                if not key.startswith("__"):
+                    probe_seen[key] = max(probe_seen.get(key, 0.0), float(value))
+        findings.append(Finding(
+            "blocker", "reflex_never_fired",
+            f"{declared_reflexes + declared_holds} reflex rules were declared and not one "
+            f"ever triggered.",
+            "Their guards were false on every tick, so the fast layer contributed "
+            "nothing and the run happened entirely at decision rate.",
+            "Compare each guard's threshold against the highest value that probe actually "
+            "reached during the run (below). A guard on `probe('x') > 0.5` against a probe "
+            "that never exceeded 0.02 is testing the wrong region or the wrong colour; "
+            "confirm the region with voltage_capture first.",
+            {"peak_probe_values": {k: round(v, 3) for k, v in sorted(probe_seen.items())}},
+        ))
+
+    # -- reactions arriving late, or not at all ----------------------------------------
+    if stats["starved"]:
+        share = stats["starved"] / max(1, stats["starved"] + stats["fires"])
+        findings.append(Finding(
+            "problem" if share < 0.4 else "blocker",
+            "reflex_starved",
+            f"{stats['starved']} reflexes were dropped because the input device was busy.",
+            "A reflex fired while an actuator burst was still executing. Rather than "
+            "queue -- and land as a reaction to a situation that had already resolved -- "
+            "it was dropped. The fast layer is being crowded out by the slow one.",
+            "Shorten the actuator's bursts: lower policy.max_burst_ms and "
+            "max_actions_per_burst, and cut long w: waits out of the brief's example. A "
+            "burst that runs for 500 ms is 500 ms in which nothing can react.",
+            {"dropped": stats["starved"], "fired": stats["fires"]},
+        ))
+
+    # -- the loop could not keep up ----------------------------------------------------
+    measured, requested = stats.get("measured_hz"), stats.get("requested_hz")
+    if measured and requested and measured < requested * 0.6:
+        findings.append(Finding(
+            "problem", "reflex_rate_low",
+            f"The reflex loop asked for {requested:g} Hz and achieved {measured:g} Hz.",
+            "Almost always the capture backend: a streaming source costs ~2 ms a frame, "
+            "while one that does a fresh grab per call costs 15-40 ms and cannot be run "
+            "at 20 Hz without eating the machine the models need.",
+            "Check `voltage_doctor` for which capture backend is active. 'portal' streams "
+            "and will hold the rate; 'kwin' and 'grim' do a round trip per frame. If you "
+            "are stuck on a non-streaming backend, set reflex_hz to what it can sustain "
+            "so the loop stops trying and the timing in your guards stays honest.",
+            {"requested_hz": requested, "measured_hz": measured, "ticks": stats.get("ticks")},
+        ))
+
+    # -- a latch flipping on its own threshold -----------------------------------------
+    flips = stats["hold_on"] + stats["hold_off"]
+    if declared_holds and elapsed > 1.0 and flips / elapsed > 4.0:
+        by_rule = Counter(
+            str(r.get("rule", "?")) for r in journal
+            if r.get("kind") in ("hold_on", "hold_off")
+        )
+        findings.append(Finding(
+            "problem", "latch_chatter",
+            f"Hold reflexes engaged and released {flips} times in {elapsed:.0f}s.",
+            "A latch whose guard sits on its threshold flips at reflex rate. Downstream "
+            "that is not a held key at all -- it is a machine-gun of taps, which a game "
+            "reads as a character twitching in place rather than moving.",
+            "Give the latch hysteresis: set `release_when` to a threshold wider than "
+            "`when`, so there is a dead band in which neither fires and the latch keeps "
+            "its state. `when: probe('x') < 90` with `release_when: probe('x') > 110`. "
+            "`min_hold_ms` is the blunter alternative.",
+            {"flips_per_second": round(flips / elapsed, 1), "by_rule": dict(by_rule)},
+        ))
+
+    # -- an expression that cannot be turned into a burst ------------------------------
+    if stats["render_errors"]:
+        sample = next(
+            (str(r.get("error", "")) for r in journal
+             if r.get("kind") in ("reflex_error", "burst_error")), ""
+        )
+        findings.append(Finding(
+            "problem", "burst_render_error",
+            f"{stats['render_errors']} bursts could not be built from their expressions.",
+            "An {expression} hole produced a value the burst DSL will not accept -- "
+            "usually a coordinate off the edge of the screen from an unclamped steering "
+            "term. The fire was skipped rather than sending the pointer somewhere "
+            "arbitrary.",
+            "Wrap the term: `m:{clamp(probe('tx'), 0, 1919)},540`. For a relative move, "
+            "clamp the step instead: `r:{clamp(probe('err') * 0.4, -300, 300)},0`.",
+            {"count": stats["render_errors"], "first": sample},
+        ))
+
+    # -- a number probe that never produced a number -----------------------------------
+    ocr = stats.get("ocr") or {}
+    if number_probes and ocr and not ocr.get("reads") and ocr.get("misses"):
+        findings.append(Finding(
+            "blocker", "number_probe_never_read",
+            f"Number probes {number_probes} never produced a value; "
+            f"{ocr.get('misses')} reads failed.",
+            "A number probe that cannot read returns 0, and a guard cannot tell that "
+            "apart from a HUD that genuinely says 0. Every threshold on it has been "
+            "silently comparing against zero for the whole run.",
+            "Run voltage_doctor and check the `ocr` line -- on most distributions the "
+            "language data is a separate package from tesseract itself. If OCR is "
+            "healthy, the region is wrong: voltage_capture, find the digits, and set the "
+            "region tightly around them. Set `invert: true` for dark text on light.",
+            {"probes": number_probes, **ocr},
+        ))
+
+    return findings
 
 
 def _refusal_fix(rule: str) -> str:

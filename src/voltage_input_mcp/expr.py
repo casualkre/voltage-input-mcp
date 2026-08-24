@@ -160,6 +160,47 @@ def _fn_rejections(ctx: GuardContext) -> int:
     return int(ctx.run.get("rejections", 0))
 
 
+def _fn_rate(ctx: GuardContext, name: str, default: float = 0.0) -> float:
+    """Rate of change of a number probe, per second.
+
+    Sugar for `probe('<name>__rate')`, which the probe engine publishes alongside every
+    number probe. Worth having as its own function because rate is what most continuous
+    control actually keys off: `rate('meters') < -60` is "falling fast", and expressing
+    that as a string suffix invites a typo that silently reads 0.0 forever.
+    """
+    return _fn_probe(ctx, f"{name}__rate", default)
+
+
+def _fn_held(ctx: GuardContext, name: str) -> bool:
+    """True if the executor is currently holding this key or button (`btn:l` for mouse).
+
+    Lets a guard avoid fighting itself: `not held('w')` stops a rule re-pressing what a
+    latch already has down.
+    """
+    return name in ctx.held
+
+
+def _fn_latched(ctx: GuardContext, rule_id: str) -> bool:
+    """True if the named hold reflex is currently engaged."""
+    return rule_id in ctx.latched
+
+
+def _fn_clamp(value: Any, low: Any, high: Any) -> Any:
+    """Constrain a value to [low, high].
+
+    Present because the alternative in a steering expression is `min(max(v, lo), hi)`,
+    which the small models and humans both get inside out, and because an unclamped
+    servo term is the standard way an interpolated burst produces an off-screen move.
+    """
+    if low > high:
+        low, high = high, low
+    return low if value < low else (high if value > high else value)
+
+
+def _fn_sign(value: Any) -> int:
+    return (value > 0) - (value < 0)
+
+
 # Signature note: context-taking functions are bound at eval time; pure ones are not.
 _CTX_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "sees": _fn_sees,
@@ -168,7 +209,10 @@ _CTX_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "text": _fn_text,
     "flag": _fn_flag,
     "probe": _fn_probe,
+    "rate": _fn_rate,
     "var": _fn_var,
+    "held": _fn_held,
+    "latched": _fn_latched,
     "elapsed": _fn_elapsed,
     "cycles": _fn_cycles,
     "run_elapsed": _fn_run_elapsed,
@@ -190,6 +234,8 @@ _PURE_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "bool": bool,
     "any": any,
     "all": all,
+    "clamp": _fn_clamp,
+    "sign": _fn_sign,
 }
 
 GUARD_FUNCTIONS: frozenset[str] = frozenset(_CTX_FUNCTIONS) | frozenset(_PURE_FUNCTIONS)
@@ -214,6 +260,12 @@ class GuardContext:
     vars: dict[str, Any] = field(default_factory=dict)
     state: dict[str, Any] = field(default_factory=dict)
     run: dict[str, Any] = field(default_factory=dict)
+    # Keys and buttons the executor has down right now (`btn:l` for mouse buttons), and
+    # the ids of hold reflexes currently engaged. Both are needed so a guard can see the
+    # effect of the previous tick -- without them a latch cannot express hysteresis and a
+    # rule cannot tell whether it already did the thing it is about to do again.
+    held: set[str] = field(default_factory=set)
+    latched: set[str] = field(default_factory=set)
 
     def namespace(self, name: str) -> Mapping[str, Any]:
         if name == "obs":
@@ -364,17 +416,25 @@ class Guard:
 
     @property
     def referenced_probes(self) -> set[str]:
+        """Probe ids this guard reads, for cross-checking against `playbook.probes`.
+
+        `rate('x')` counts as a reference to `x`: the derivative is published by the
+        probe engine, so what has to exist in the playbook is the base probe. The
+        `__rate` suffix is stripped for the same reason -- someone who writes
+        `probe('meters__rate')` by hand still needs `meters` declared.
+        """
         probes: set[str] = set()
         for node in ast.walk(ast.Expression(body=self._tree)):
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
-                and node.func.id == "probe"
+                and node.func.id in ("probe", "rate")
                 and node.args
                 and isinstance(node.args[0], ast.Constant)
                 and isinstance(node.args[0].value, str)
             ):
-                probes.add(node.args[0].value)
+                name = node.args[0].value
+                probes.add(name.removesuffix("__rate"))
         return probes
 
     def evaluate(self, ctx: GuardContext) -> Any:

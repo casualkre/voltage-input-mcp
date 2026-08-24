@@ -13,19 +13,27 @@ Return contract -- every probe yields a float in [0, 1] so guards can threshold 
     region_diff  fraction of pixels in the region that changed since the last frame
     template     best normalised cross-correlation score in the search region
 
-Two probes are always published, whether or not the playbook declares any:
+Three probes are always published, whether or not the playbook declares any:
 
-    __frame_delta__  fraction of the whole frame that changed since the previous frame
-    __static_for__   seconds the screen has been materially unchanged
+    __frame_delta__      fraction of the whole frame that changed since the previous call
+    __static_for__       seconds the screen has been materially unchanged
+    __delta_vs_vision__  fraction that has changed since the vision model last looked
 
-They back the `changed()` and `stalled()` guard functions and, more importantly, gate
-whether the vision model runs at all this cycle.
+The first two back the `changed()` and `stalled()` guard functions. The third gates
+whether the vision model runs at all, and it is separate for a reason that only became
+apparent once reflexes moved into their own loop: with two loops calling `evaluate()`,
+`__frame_delta__` means "changed in the last 50 ms", which is not the question
+`perception.mode = on_change` is asking. That question is "does the screen still look
+like what the VLM last saw", and it can only be answered against a baseline captured at
+that moment -- so one is kept.
 """
 
 from __future__ import annotations
 
 import re
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,10 +62,19 @@ def parse_hex_colour(value: str) -> np.ndarray:
 
 @dataclass(slots=True)
 class ProbeEngine:
-    """Evaluates a playbook's probes against each frame, holding per-probe history."""
+    """Evaluates a playbook's probes against each frame, holding per-probe history.
+
+    One engine serves both loops. The reflex loop calls `evaluate()` at reflex rate and
+    the decision loop reads the result, so probe history is single-sourced and the two
+    loops cannot disagree about what the screen is doing. Everything on this path is
+    bounded and non-blocking: the slowest measurement is a template match over a small
+    region, and OCR -- the one genuinely slow probe -- is handed to a background worker
+    and never awaited.
+    """
 
     specs: list[ProbeSpec] = field(default_factory=list)
     _prev_thumb: np.ndarray | None = field(default=None, init=False)
+    _vision_thumb: np.ndarray | None = field(default=None, init=False)
     _prev_regions: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     _templates: dict[str, np.ndarray] = field(default_factory=dict, init=False)
     _static_since: float = field(default_factory=time.monotonic, init=False)
@@ -65,27 +82,67 @@ class ProbeEngine:
     _numbers: dict[str, float] = field(default_factory=dict, init=False)
     _number_at: dict[str, float] = field(default_factory=dict, init=False)
     _rates: dict[str, float] = field(default_factory=dict, init=False)
-    _ocr_ticks: dict[str, int] = field(default_factory=dict, init=False)
+    _ocr_asked: dict[str, float] = field(default_factory=dict, init=False)
+    _ocr_inflight: dict[str, Future] = field(default_factory=dict, init=False)
+    _ocr_reads: int = field(default=0, init=False)
+    _ocr_misses: int = field(default=0, init=False)
+    _pool: ThreadPoolExecutor | None = field(default=None, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
 
     def reset(self) -> None:
         self._prev_thumb = None
-        self._numbers.clear()
-        self._number_at.clear()
-        self._rates.clear()
-        self._ocr_ticks.clear()
+        self._vision_thumb = None
+        with self._lock:
+            self._numbers.clear()
+            self._number_at.clear()
+            self._rates.clear()
+        self._ocr_asked.clear()
+        self._ocr_inflight.clear()
+        self._ocr_reads = 0
+        self._ocr_misses = 0
         self._prev_regions.clear()
         self._static_since = time.monotonic()
         self._last_values.clear()
+
+    def close(self) -> None:
+        """Drop the OCR worker. Safe to call more than once."""
+        pool, self._pool = self._pool, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     @property
     def last(self) -> dict[str, float]:
         return dict(self._last_values)
 
+    def ocr_stats(self) -> dict[str, int]:
+        """Successful and failed OCR reads, for diagnosis.
+
+        A number probe that never resolves looks exactly like one reading a steady zero,
+        and a guard cannot tell the difference. Counting the failures is what lets
+        `voltage_diagnose` say "this probe has never produced a number" instead of the
+        playbook author concluding the HUD really does say 0.
+        """
+        return {"reads": self._ocr_reads, "misses": self._ocr_misses}
+
+    def mark_perceived(self, frame: Frame) -> None:
+        """Record that the vision model has just looked at this frame.
+
+        Sets the baseline `__delta_vs_vision__` measures against. Called by the session
+        immediately after a successful vision call, and only then -- a skipped or failed
+        call must leave the old baseline in place, or the loop concludes the screen is
+        unchanged relative to an observation it never made.
+        """
+        self._vision_thumb = _thumbnail_luma(frame.pixels)
+
     def evaluate(self, frame: Frame) -> dict[str, float]:
         values: dict[str, float] = {}
 
-        delta = self._frame_delta(frame)
+        thumb = _thumbnail_luma(frame.pixels)
+        prev, self._prev_thumb = self._prev_thumb, thumb
+        delta = _thumb_delta(thumb, prev)
         values["__frame_delta__"] = delta
+        values["__delta_vs_vision__"] = _thumb_delta(thumb, self._vision_thumb)
+
         now = time.monotonic()
         if delta > 0.004:
             self._static_since = now
@@ -97,10 +154,11 @@ class ProbeEngine:
             except Exception:  # noqa: BLE001 - a broken probe must not stop the loop
                 values[spec.id] = 0.0
 
-        # Derivatives ride alongside, so `probe('meters__rate')` is available without the
+        # Derivatives ride alongside, so `rate('meters')` is available without the
         # playbook differencing anything itself.
-        for key, rate in self._rates.items():
-            values[f"{key}__rate"] = rate
+        with self._lock:
+            for key, rate in self._rates.items():
+                values[f"{key}__rate"] = rate
 
         self._last_values = values
         return values
@@ -108,39 +166,72 @@ class ProbeEngine:
     # -- individual probes -----------------------------------------------------------
 
     def _number(self, spec: ProbeSpec, frame: Frame) -> float:
-        """Read a number off the HUD.
+        """Read a number off the HUD, without ever waiting for the read.
 
-        Two-tier by necessity. OCR is 80-200 ms -- unusable in the reflex path -- so it
-        runs every `ocr_every` frames and the cached value serves in between. A reflex
-        guarding on `probe('mph')` therefore evaluates in microseconds against a number
-        that is at most a few frames stale, which for a falling character is fine and
-        for a menu is exact.
+        OCR is 80-200 ms. Doing it inline would make a 20 Hz reflex loop into a 5 Hz one
+        the moment a playbook declares a number probe -- the probe meant to make control
+        possible would be the thing that made it impossible. So this never runs tesseract
+        on the calling thread. It returns the last value it has and, if that value is
+        older than `ocr_interval_ms`, hands a copy of the patch to a single background
+        worker to refresh in the meantime.
+
+        The consequence is that a number is always slightly stale, by one OCR round trip.
+        For a falling character at 170 m/s that is around 20 m of error, which is why
+        `rate()` exists: extrapolating from a rate is more accurate than waiting for a
+        fresher absolute value would have been, and costs nothing.
         """
-        self._ocr_ticks[spec.id] = self._ocr_ticks.get(spec.id, 0) + 1
-        cached = self._numbers.get(spec.id)
-        if cached is not None and self._ocr_ticks[spec.id] % spec.ocr_every:
-            return cached
-
         assert spec.region is not None
-        patch = self._patch(spec.region, frame)
-        if patch.size == 0:
-            return cached if cached is not None else 0.0
+        with self._lock:
+            cached = self._numbers.get(spec.id)
 
+        now = time.monotonic()
+        asked = self._ocr_asked.get(spec.id, 0.0)
+        due = (now - asked) * 1000.0 >= spec.ocr_interval_ms
+        inflight = self._ocr_inflight.get(spec.id)
+        if inflight is not None and inflight.done():
+            self._ocr_inflight.pop(spec.id, None)
+            inflight = None
+
+        if due and inflight is None:
+            patch = self._patch(spec.region, frame)
+            if patch.size:
+                self._ocr_asked[spec.id] = now
+                # .copy() because the frame buffer is reused by streaming backends; the
+                # worker would otherwise OCR whatever the screen looks like when it gets
+                # around to it rather than what it was handed.
+                self._ocr_inflight[spec.id] = self._worker().submit(
+                    self._ocr_into, spec, patch.copy()
+                )
+
+        return cached if cached is not None else 0.0
+
+    def _worker(self) -> ThreadPoolExecutor:
+        if self._pool is None:
+            # One worker, deliberately. Number probes are read off small fixed HUD
+            # regions, so several in parallel would contend for the same cores that the
+            # capture and the two model servers need, to shave latency off a value that
+            # is already only used for thresholds.
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voltage-ocr")
+        return self._pool
+
+    def _ocr_into(self, spec: ProbeSpec, patch: np.ndarray) -> None:
         value = _ocr_number(patch, invert=spec.invert)
         if value is None:
-            return cached if cached is not None else 0.0
-
+            self._ocr_misses += 1
+            return
+        self._ocr_reads += 1
         value *= spec.scale
         now = time.monotonic()
-        previous, previous_at = self._numbers.get(spec.id), self._number_at.get(spec.id)
-        if previous is not None and previous_at and now > previous_at:
-            # Rate of change, published as `<id>__rate`. This is what makes descent
-            # speed, income per second and progress bars usable in a guard without the
-            # playbook having to difference them by hand.
-            self._rates[spec.id] = (value - previous) / (now - previous_at)
-        self._numbers[spec.id] = value
-        self._number_at[spec.id] = now
-        return value
+        with self._lock:
+            previous = self._numbers.get(spec.id)
+            previous_at = self._number_at.get(spec.id)
+            if previous is not None and previous_at and now > previous_at:
+                # Rate of change, published as `<id>__rate`. This is what makes descent
+                # speed, income per second and progress bars usable in a guard without
+                # the playbook having to difference them by hand.
+                self._rates[spec.id] = (value - previous) / (now - previous_at)
+            self._numbers[spec.id] = value
+            self._number_at[spec.id] = now
 
     def _evaluate_one(self, spec: ProbeSpec, frame: Frame) -> float:
         if spec.type == "pixel":
@@ -250,13 +341,17 @@ class ProbeEngine:
         self._templates[path] = arr
         return arr
 
-    def _frame_delta(self, frame: Frame) -> float:
-        thumb = _thumbnail_luma(frame.pixels)
-        prev = self._prev_thumb
-        self._prev_thumb = thumb
-        if prev is None or prev.shape != thumb.shape:
-            return 1.0  # first frame counts as fully changed, so perception runs
-        return float((np.abs(thumb - prev) > _PIXEL_CHANGE_THRESHOLD).mean())
+
+def _thumb_delta(thumb: np.ndarray, baseline: np.ndarray | None) -> float:
+    """Fraction of the thumbnail that differs from a baseline.
+
+    A missing or differently shaped baseline counts as fully changed, so the first frame
+    -- and the frame after a resolution change -- always triggers perception rather than
+    being quietly treated as "nothing moved".
+    """
+    if baseline is None or baseline.shape != thumb.shape:
+        return 1.0
+    return float((np.abs(thumb - baseline) > _PIXEL_CHANGE_THRESHOLD).mean())
 
 
 _NUMBER_RE = re.compile(r"-?\d[\d,.]*")

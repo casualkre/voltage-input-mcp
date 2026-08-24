@@ -126,6 +126,8 @@ class App:
             keep_frames=self.config.keep_frames,
             settle_ms=self.config.settle_ms,
             watch_physical_input=self.config.watch_physical_input,
+            reflex_hz=self.config.reflex_hz,
+            reflex_enabled=self.config.reflex_hz > 0,
         )
         for key, value in overrides.items():
             if value is not None and hasattr(base, key):

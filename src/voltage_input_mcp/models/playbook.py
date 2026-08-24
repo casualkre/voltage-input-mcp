@@ -29,13 +29,15 @@ Everything else must name a state in `states`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..errors import PlaybookError
 from ..expr import Guard
-from .burst import Burst, parse_burst
+from .burst import Burst, parse_hold
+from .template import BurstTemplate
 
 __all__ = [
     "Playbook",
@@ -48,6 +50,9 @@ __all__ = [
     "Perception",
     "Rect",
     "CompiledPlaybook",
+    "CompiledState",
+    "CompiledReflex",
+    "CompiledHold",
     "compile_playbook",
     "TERMINALS",
 ]
@@ -119,11 +124,15 @@ class ProbeSpec(BaseModel):
     # Reading a HUD number is what turns a guard into a physics condition:
     # `probe('mph') > 120 and probe('meters') < 150` is the difference between flying a
     # character and jumping off and praying. OCR costs ~80-200 ms, far too slow for the
-    # reflex path, so it runs on a cadence and every cycle in between reads the cached
-    # value at no cost. Reflexes therefore fire on real numbers at full frame rate.
-    ocr_every: int = Field(
-        default=3, ge=1, le=60,
-        description="re-read every N frames; in between, the cached value is reused",
+    # reflex path, so it runs on a background worker and every read in between returns
+    # the last value at no cost. Reflexes therefore fire on real numbers at full rate.
+    ocr_interval_ms: int = Field(
+        default=120, ge=20, le=10_000,
+        description=(
+            "how often to re-read, in milliseconds. Wall-clock rather than a frame count "
+            "so the cadence does not change when the loop rate does -- the same probe "
+            "belongs to a 2 Hz decision loop and a 20 Hz reflex loop at once."
+        ),
     )
     invert: bool = Field(
         default=False, description="set for dark text on a light background"
@@ -154,25 +163,88 @@ class ProbeSpec(BaseModel):
 
 
 class ReflexRule(BaseModel):
-    """A deterministic, model-free rule: condition -> burst.
+    """A deterministic, model-free rule. Either a one-shot burst or a latched hold.
 
     Reflexes run on every captured frame, between actuator decisions. This is the second
     half of the latency answer: bursts give you many inputs per decision, reflexes give
     you inputs with no decision at all. A reflex should only depend on probes and cached
     observation state, never on anything that needs fresh vision.
+
+    Two shapes, and the difference matters more than it looks:
+
+    **`do`** is a one-shot. The guard goes true, the burst runs, the cooldown starts. Good
+    for discrete reactions -- press the button, dodge, dismiss the dialog.
+
+    **`hold`** is a latch. The guard goes true and the keys go *down*; they stay down,
+    across frames and across decisions, until the guard goes false again. This is what
+    continuous control needs and what a one-shot cannot express: "hold W while the target
+    is ahead" as a one-shot is a stutter of taps at reflex rate, which in a game reads as
+    a character twitching in place rather than running.
+
+    A latch is background state, so it never suppresses the actuator regardless of
+    `exclusive` -- the point of holding W is that the decision layer keeps thinking while
+    the character keeps moving.
+
+    Chatter at the threshold is the failure mode a latch has and a one-shot does not: a
+    guard sitting on its boundary flips at reflex rate and machine-guns the key. Both
+    remedies are here. `release_when` gives a separate, wider falling-edge condition -- a
+    Schmitt trigger, which is the honest fix -- and `min_hold_ms` sets a floor on how long
+    a press lasts once made.
     """
 
     model_config = ConfigDict(frozen=True)
 
     id: Ident
     when: str = Field(description="guard expression, e.g. probe('health') < 0.25")
-    do: str = Field(description="burst to execute, e.g. k:q;w:60")
+    do: str | None = Field(
+        default=None,
+        description="one-shot burst, e.g. k:q;w:60. May contain {expression} holes.",
+    )
+    hold: str | None = Field(
+        default=None,
+        description="keys/buttons to hold while `when` is true, e.g. 'w' or 'shift, btn:r'",
+    )
+    release_when: str | None = Field(
+        default=None,
+        description=(
+            "hold only: separate guard for letting go. Defaults to `not (when)`. Give it a "
+            "wider threshold than `when` to stop the latch chattering on the boundary."
+        ),
+    )
+    min_hold_ms: int = Field(
+        default=0, ge=0, le=60_000,
+        description="hold only: once pressed, stay down at least this long",
+    )
     cooldown_ms: int = Field(default=500, ge=0, le=60_000)
     max_fires: int | None = Field(default=None, ge=1)
     priority: int = Field(default=0, description="higher wins when several fire at once")
     exclusive: bool = Field(
-        default=True, description="if true, suppress the actuator this cycle when it fires"
+        default=True,
+        description=(
+            "one-shot only: suppress the next actuator decision when it fires, so a "
+            "stale decision cannot override a fresh reaction. Ignored for `hold`."
+        ),
     )
+
+    @model_validator(mode="after")
+    def _one_shape_only(self) -> ReflexRule:
+        if bool(self.do) == bool(self.hold):
+            raise ValueError(
+                f"reflex {self.id!r} must set exactly one of `do` (a one-shot burst) or "
+                f"`hold` (keys held while the guard is true)"
+            )
+        if not self.hold:
+            if self.release_when:
+                raise ValueError(
+                    f"reflex {self.id!r} sets `release_when`, which only means something "
+                    f"for a `hold` -- a one-shot `do` has nothing to let go of"
+                )
+            if self.min_hold_ms:
+                raise ValueError(
+                    f"reflex {self.id!r} sets `min_hold_ms`, which only applies to a "
+                    f"`hold`; for a one-shot use `cooldown_ms`"
+                )
+        return self
 
 
 class Transition(BaseModel):
@@ -321,7 +393,24 @@ class Policy(BaseModel):
         default=True, description="permit d:/p: without a matching release inside the burst"
     )
     max_hold_ms: int = Field(
-        default=4000, ge=0, le=30_000, description="auto-release anything held longer"
+        default=4000, ge=0, le=30_000,
+        description=(
+            "auto-release anything held longer. This is the safety net for input nobody "
+            "is watching -- a burst that ended with d: and no matching u:. Keys held by "
+            "a latched `hold` reflex are exempt, because a guard re-evaluating them "
+            "twenty times a second is stricter supervision than a timer."
+        ),
+    )
+    pointer_mode: Literal["absolute", "relative"] | None = Field(
+        default=None,
+        description=(
+            "override the machine's pointer mode for this run only. Games with pointer "
+            "lock need 'relative' -- absolute positioning fights the game's own camera, "
+            "and mouse-look does not work at all. Desktop UI needs 'absolute'. Setting it "
+            "here rather than in voltage.toml means a game playbook and a desktop "
+            "playbook can run on the same machine without an edit and a restart between "
+            "them. Restored when the run ends."
+        ),
     )
     dry_run: bool = Field(
         default=True,
@@ -447,11 +536,40 @@ class Playbook(BaseModel):
 # --------------------------------------------------------------------------------------
 
 
+@dataclass(frozen=True, slots=True)
+class CompiledReflex:
+    """A one-shot reflex: guard plus the burst template it fires."""
+
+    rule: ReflexRule
+    guard: Guard
+    template: BurstTemplate
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledHold:
+    """A latch: guard, its release condition, and the press/release bursts.
+
+    `release` is stored as its own guard rather than being derived by negating `when` at
+    evaluation time, because the useful case is precisely the one where it is *not* the
+    negation. `when: probe('meters') < 90` with `release_when: probe('meters') > 110`
+    leaves a 20 m dead band in which neither fires and the latch simply keeps its current
+    state -- which is what stops it chattering.
+    """
+
+    rule: ReflexRule
+    guard: Guard
+    release: Guard | None
+    press: Burst
+    release_burst: Burst
+    names: tuple[str, ...]
+
+
 class CompiledState:
     """A state with its guards and bursts pre-parsed, ready for the hot loop."""
 
     __slots__ = (
-        "name", "spec", "transitions", "reflexes", "on_enter", "on_exit", "allow_verbs",
+        "name", "spec", "transitions", "reflexes", "holds", "on_enter", "on_exit",
+        "allow_verbs",
     )
 
     def __init__(
@@ -459,15 +577,17 @@ class CompiledState:
         name: str,
         spec: State,
         transitions: list[tuple[Guard, Transition]],
-        reflexes: list[tuple[Guard, Burst, ReflexRule]],
-        on_enter: Burst | None,
-        on_exit: Burst | None,
+        reflexes: list[CompiledReflex],
+        holds: list[CompiledHold],
+        on_enter: BurstTemplate | None,
+        on_exit: BurstTemplate | None,
         allow_verbs: frozenset[str],
     ) -> None:
         self.name = name
         self.spec = spec
         self.transitions = transitions
         self.reflexes = reflexes
+        self.holds = holds
         self.on_enter = on_enter
         self.on_exit = on_exit
         self.allow_verbs = allow_verbs
@@ -516,12 +636,28 @@ def _compile_guard(source: str, where: str, errors: list[str]) -> Guard | None:
         return None
 
 
-def _compile_burst(source: str, where: str, errors: list[str]) -> Burst | None:
+def _compile_burst(source: str, where: str, errors: list[str]) -> BurstTemplate | None:
     try:
-        return parse_burst(source)
+        return BurstTemplate(source)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"{where}: {exc}")
         return None
+
+
+def _compile_hold(
+    rule: ReflexRule, where: str, errors: list[str]
+) -> tuple[Burst, Burst, tuple[str, ...]] | None:
+    try:
+        return parse_hold(rule.hold or "")
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"{where}.hold: {exc}")
+        return None
+
+
+def _check_probes(guard: Guard, probe_ids: set[str], where: str, errors: list[str]) -> None:
+    missing = guard.referenced_probes - probe_ids
+    if missing:
+        errors.append(f"{where} uses undefined probes {sorted(missing)}")
 
 
 def compile_playbook(spec: Playbook) -> CompiledPlaybook:
@@ -573,24 +709,87 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                 )
             transitions.append((guard, tr))
 
-        reflexes: list[tuple[Guard, Burst, ReflexRule]] = []
+        reflexes: list[CompiledReflex] = []
+        holds: list[CompiledHold] = []
         seen_reflex_ids: set[str] = set()
         for i, rx in enumerate(st.reflex):
+            at = f"{where}.reflex[{i}]"
             if rx.id in seen_reflex_ids:
-                errors.append(f"{where}.reflex[{i}]: duplicate reflex id {rx.id!r}")
+                errors.append(f"{at}: duplicate reflex id {rx.id!r}")
             seen_reflex_ids.add(rx.id)
-            guard = _compile_guard(rx.when, f"{where}.reflex[{i}].when", errors)
-            burst = _compile_burst(rx.do, f"{where}.reflex[{i}].do", errors)
-            if guard is None or burst is None:
+
+            guard = _compile_guard(rx.when, f"{at}.when", errors)
+            if guard is None:
                 continue
-            missing_probes = guard.referenced_probes - probe_ids
-            if missing_probes:
-                errors.append(f"{where}.reflex[{i}] uses undefined probes {sorted(missing_probes)}")
-            reflexes.append((guard, burst, rx))
-        reflexes.sort(key=lambda item: -item[2].priority)
+
+            if rx.hold:
+                parsed = _compile_hold(rx, at, errors)
+                release_guard = (
+                    _compile_guard(rx.release_when, f"{at}.release_when", errors)
+                    if rx.release_when
+                    else None
+                )
+                if parsed is None or (rx.release_when and release_guard is None):
+                    continue
+                press, release_burst, names = parsed
+                _check_probes(guard, probe_ids, at, errors)
+                if release_guard is not None:
+                    _check_probes(release_guard, probe_ids, f"{at}.release_when", errors)
+                if rx.max_fires is not None:
+                    warnings.append(
+                        f"{at} is a hold, so `max_fires` counts how many times it may "
+                        f"*engage*, not how many inputs it sends; a latch that has spent "
+                        f"its fires stops responding entirely"
+                    )
+                holds.append(
+                    CompiledHold(
+                        rule=rx,
+                        guard=guard,
+                        release=release_guard,
+                        press=press,
+                        release_burst=release_burst,
+                        names=names,
+                    )
+                )
+                continue
+
+            template = _compile_burst(rx.do or "", f"{at}.do", errors)
+            if template is None:
+                continue
+            _check_probes(guard, probe_ids, at, errors)
+            missing = template.referenced_probes - probe_ids
+            if missing:
+                errors.append(f"{at}.do interpolates undefined probes {sorted(missing)}")
+            reflexes.append(CompiledReflex(rule=rx, guard=guard, template=template))
+
+        reflexes.sort(key=lambda item: -item.rule.priority)
+        holds.sort(key=lambda item: -item.rule.priority)
+
+        # Two latches fighting over one key is a stuck-input bug that only shows up when
+        # both guards happen to disagree, which is exactly when you are least able to
+        # debug it. Catch the overlap statically instead.
+        claimed: dict[str, str] = {}
+        for hold in holds:
+            for target in hold.names:
+                owner = claimed.get(target)
+                if owner is not None:
+                    errors.append(
+                        f"{where}: hold reflexes {owner!r} and {hold.rule.id!r} both hold "
+                        f"{target!r}; whichever releases first wins and the key state "
+                        f"stops tracking either guard"
+                    )
+                claimed[target] = hold.rule.id
 
         on_enter = _compile_burst(st.on_enter, f"{where}.on_enter", errors) if st.on_enter else None
         on_exit = _compile_burst(st.on_exit, f"{where}.on_exit", errors) if st.on_exit else None
+        for hook, template in (("on_enter", on_enter), ("on_exit", on_exit)):
+            if template is None:
+                continue
+            missing = template.referenced_probes - probe_ids
+            if missing:
+                errors.append(
+                    f"{where}.{hook} interpolates undefined probes {sorted(missing)}"
+                )
 
         verbs = frozenset(st.allow_verbs) & base_verbs if st.allow_verbs else base_verbs
         if st.allow_verbs and not verbs:
@@ -614,12 +813,19 @@ def compile_playbook(spec: Playbook) -> CompiledPlaybook:
                 f"{where} is autonomous but has an empty `watch` list and there are no probes, "
                 f"so the actuator will act blind"
             )
+        if holds and not probe_ids:
+            warnings.append(
+                f"{where} has hold reflexes but the playbook declares no probes, so every "
+                f"latch is driven by cached vision at decision rate. That is the one thing "
+                f"a latch cannot do well -- give it a probe to key off"
+            )
 
         compiled[name] = CompiledState(
             name=name,
             spec=st,
             transitions=transitions,
             reflexes=reflexes,
+            holds=holds,
             on_enter=on_enter,
             on_exit=on_exit,
             allow_verbs=verbs,

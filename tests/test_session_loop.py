@@ -135,8 +135,46 @@ async def test_on_change_mode_skips_the_vision_model_on_a_static_screen():
     session, capture, deps = build(playbook, [VISION_SEES_TARGET], [".|.|idle"])
     await session.start()
     # The screen never changes, so vision should run about once, not once per cycle.
-    assert capture.grabs >= 5
+    assert capture.grabs >= 1
     assert deps.vision.calls <= 2, f"vision ran {deps.vision.calls} times on a static screen"
+    # And the decision loop reuses the reflex loop's frame rather than grabbing its own,
+    # so captures are strictly fewer than cycles. Asserting one grab per cycle -- which
+    # this test used to do -- would be asserting the duplication away again.
+    assert capture.grabs < session._cycle, (
+        f"{capture.grabs} captures for {session._cycle} cycles; the loops are not sharing"
+    )
+
+
+async def test_on_change_measures_against_the_frame_vision_last_saw():
+    """The gate asks "has the screen moved since the VLM looked", not "since last frame".
+
+    With reflexes sampling at 20 Hz and decisions at 2 Hz, a delta measured against the
+    previous frame answers a question about the last 50 ms. A screen that drifts steadily
+    would then read as unchanged on every individual comparison and vision would never
+    run again.
+    """
+    playbook = {**BASIC, "perception": {"mode": "on_change", "change_threshold": 0.02}}
+    playbook["states"] = {
+        "find": {
+            "brief": "wait",
+            "watch": ["target"],
+            "transitions": [{"when": "run_cycles() >= 4", "to": "@success"}],
+        }
+    }
+    session, capture, deps = build(
+        playbook, [VISION_SEES_TARGET], [".|.|idle"], target_period_s=0.05
+    )
+    # Mutate on every grab, so each individual frame differs from the last and from the
+    # baseline. Vision must keep running.
+    original = capture.grab
+
+    def mutating_grab(region=None):
+        capture.mutate()
+        return original(region)
+
+    capture.grab = mutating_grab  # type: ignore[method-assign]
+    await session.start()
+    assert deps.vision.calls >= 2, "a screen that keeps changing must keep being looked at"
 
 
 async def test_reflex_preempts_the_actuator():

@@ -10,8 +10,108 @@ from typing import Any
 
 __all__ = [
     "BURST_REFERENCE", "GUARD_REFERENCE", "EXAMPLE_PLAYBOOK",
-    "BURST_COOKBOOK", "LEARNING_LOOP",
+    "BURST_COOKBOOK", "LEARNING_LOOP", "CONTINUOUS_CONTROL",
 ]
+
+
+CONTINUOUS_CONTROL: dict[str, Any] = {
+    "read_this_if": (
+        "You are about to drive anything with timing in it -- a game, a drag, a slider, "
+        "an animation, a progress bar you have to catch. Also read it if a run 'worked' "
+        "but felt like a series of guesses rather than control."
+    ),
+    "the_problem": (
+        "A decision costs 150-600 ms. If every input waits on one, the effective input "
+        "rate is 2 Hz no matter how fast the inputs themselves are. Bursts fix this "
+        "*within* a decision -- one decision, forty inputs -- but between decisions "
+        "nothing reacts. In a game that is the difference between flying a character and "
+        "jumping off and hoping. The fast layer is what fills the gap, and a playbook "
+        "that declares no probes and no reflexes is not using it at all."
+    ),
+    "three_layers": {
+        "decision (~2 Hz)": "The actuator model. Chooses *what to do next* from a "
+                            "screenshot and a brief. Emits a burst.",
+        "burst (ms precision)": "A timed programme executed with no model in the loop. "
+                                "Scheduled against a monotonic cursor, so a 40-action "
+                                "burst lands within a few ms of nominal.",
+        "reflex (~20 Hz)": "Guards over probes, evaluated in its own loop between "
+                           "decisions. No model, no vision, microseconds per rule. This "
+                           "is the only layer that can react to something that happens "
+                           "in less than half a second.",
+    },
+    "probes_first": (
+        "A reflex is only as good as what it can measure, and the vision model is far too "
+        "slow to be in that path. Declare a probe for every quantity a fast rule needs. "
+        "`number` probes read a HUD figure through OCR on a background worker -- a guard "
+        "reads the last value in microseconds and never waits. Each also publishes a "
+        "derivative, so `rate('meters')` is descent speed with no differencing in the "
+        "playbook."
+    ),
+    "do_versus_hold": {
+        "do": "A one-shot. Guard goes true, burst runs, cooldown starts. For discrete "
+              "reactions: press the button, dodge, dismiss the dialog.",
+        "hold": "A latch. Guard goes true and the keys go *down*, and stay down across "
+                "frames and across decisions until the guard goes false. For anything "
+                "continuous: running, mouse-look, holding a drag open, charging an "
+                "attack.",
+        "why_it_matters": "'hold w while the target is ahead' written as a `do` is a "
+                          "stutter of taps at reflex rate, which reads on screen as a "
+                          "character twitching in place rather than moving. It is the "
+                          "single most common way a playbook looks right and behaves "
+                          "wrong.",
+    },
+    "hysteresis": (
+        "A latch whose guard sits on its threshold flips at reflex rate. Give it a "
+        "`release_when` wider than `when` so a dead band exists in which neither is true "
+        "and the latch keeps its state -- a Schmitt trigger. `when: probe('m') < 90` with "
+        "`release_when: probe('m') > 110`. `min_hold_ms` is the blunter alternative. "
+        "voltage_diagnose reports this as `latch_chatter`."
+    ),
+    "expressions_in_bursts": (
+        "A playbook-authored burst may contain {expression} holes, evaluated against the "
+        "live context when it fires. This is what makes an action proportional to an "
+        "error rather than a constant: `r:{clamp((probe('tx') - 960) * 0.4, -300, 300)},0` "
+        "is a steering controller in one line, running at reflex rate. Holes may appear in "
+        "reflex `do`, `on_enter` and `on_exit` -- not in what the actuator emits, which "
+        "stays literal and grammar-bounded. Always clamp a term that becomes a coordinate; "
+        "an unclamped servo overshoots off-screen and the fire is dropped."
+    ),
+    "worked_example": {
+        "task": "Air-control a falling character: brake before impact, steer toward a "
+                "landing target, and keep running while airborne.",
+        "probes": [
+            {"id": "meters", "type": "number", "region": {"x": 1650, "y": 60, "w": 150, "h": 40},
+             "ocr_interval_ms": 100},
+            {"id": "mph", "type": "number", "region": {"x": 1650, "y": 110, "w": 150, "h": 40},
+             "ocr_interval_ms": 100},
+        ],
+        "reflex": [
+            {"_comment": "A latch: hold forward for the whole descent, not a tap per tick.",
+             "id": "glide", "when": "probe('meters') > 40",
+             "release_when": "probe('meters') < 15", "hold": "w"},
+            {"_comment": "A one-shot: brake once, low and falling fast. Exclusive, so a "
+                         "stale decision cannot override it.",
+             "id": "brake", "when": "probe('meters') < 90 and rate('meters') < -50",
+             "do": "k:space", "cooldown_ms": 250, "priority": 10},
+            {"_comment": "Proportional steer. The hole makes the correction match the "
+                         "error; clamp keeps it on screen.",
+             "id": "steer", "when": "abs(probe('mph')) > 5",
+             "do": "r:{clamp((960 - probe('mph') * 3), -250, 250)},0", "cooldown_ms": 60},
+        ],
+        "notes": "The decision layer never sees any of this. It is choosing where to go "
+                 "next while the fast layer flies. That division is the whole design.",
+    },
+    "checklist": [
+        "Every quantity a fast rule needs is a probe, not a question for the vision model.",
+        "Anything continuous is a `hold`, not a repeated `do`.",
+        "Every `hold` has either a `release_when` wider than its `when`, or a min_hold_ms.",
+        "Every hole that becomes a coordinate is wrapped in clamp().",
+        "policy.max_burst_ms is short. A burst that runs 500 ms is 500 ms in which no "
+        "reflex can reach the device -- voltage_diagnose reports that as reflex_starved.",
+        "After the run, check voltage_diagnose's `reflex` block: measured_hz should be "
+        "close to requested, fires should be non-zero, starved should be zero.",
+    ],
+}
 
 
 BURST_REFERENCE: dict[str, Any] = {
@@ -65,8 +165,14 @@ GUARD_REFERENCE: dict[str, Any] = {
         "conf(label)": "highest confidence for this label, 0.0 if absent",
         "text(pattern)": "case-insensitive regex over text the vision model read",
         "flag(name)": "a vision flag is set: dialog, loading, error, empty, fullscreen, occluded",
-        "probe(id, default=0.0)": "value of a declared probe, always 0.0-1.0",
+        "probe(id, default=0.0)": "value of a declared probe. 0.0-1.0 for pixel, "
+                                  "brightness, diff and template probes; the real "
+                                  "measured figure for a `number` probe",
+        "rate(id)": "rate of change per second of a number probe -- descent speed, income "
+                    "per second, how fast a bar is filling",
         "var(name, default=None)": "a run variable",
+        "held(name)": "a key or button is down right now; 'btn:l' for mouse buttons",
+        "latched(rule_id)": "a hold reflex is currently engaged",
         "elapsed()": "seconds since entering the current state",
         "cycles()": "loop cycles spent in the current state",
         "run_elapsed() / run_cycles()": "totals for the whole run",
@@ -74,6 +180,10 @@ GUARD_REFERENCE: dict[str, Any] = {
         "stalled(seconds=3.0)": "the screen has not changed for this long",
         "last_burst_ok()": "the previous burst executed without being refused",
         "rejections()": "how many bursts the governor has refused this run",
+        "clamp(v, lo, hi)": "constrain a value -- use it on any term that becomes a "
+                            "coordinate, or a servo will eventually send the pointer "
+                            "off-screen",
+        "sign(v)": "-1, 0 or 1. Turns an error into a direction",
         "abs min max len int float round bool any all": "plain helpers",
     },
     "namespaces": {
@@ -82,13 +192,16 @@ GUARD_REFERENCE: dict[str, Any] = {
         "probes.<id>": "raw probe value",
         "state.cycles / state.elapsed / state.name": "current state counters",
         "run.cycles / run.elapsed / run.bursts / run.rejections": "run counters",
+        "run.reflex_hz / run.reflex_fires": "what the fast layer is actually achieving",
     },
     "examples": [
         "sees('address bar') and vars.attempts < 3",
         "probe('health') < 0.25",
+        "probe('meters') < 90 and rate('meters') < -50",
         "stalled(4.0) or cycles() > 12",
         "text('permission denied') or flag('error')",
         "not sees('loading indicator') and sees('file list')",
+        "not held('w') and probe('clear ahead') > 0.7",
     ],
     "gotchas": [
         "A guard that tests sees('X') where 'X' is not in that state's `watch` list can "
@@ -98,6 +211,11 @@ GUARD_REFERENCE: dict[str, Any] = {
         "vars.attempts < 3 is safe before `attempts` is first assigned.",
         "Transitions are checked in order and the first true one wins. Put specific "
         "conditions before general ones.",
+        "A reflex guard runs at ~20 Hz and sees the *cached* observation -- sees() in a "
+        "reflex is up to a decision old. Probes are fresh; vision is not. Key fast rules "
+        "off probes.",
+        "A number probe that cannot read returns 0.0, which is indistinguishable from a "
+        "HUD reading zero. Check voltage_doctor's `ocr` line before trusting a threshold.",
     ],
 }
 

@@ -57,7 +57,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -171,6 +171,7 @@ class Executor:
         # name -> monotonic time it went down, for the hold watchdog and panic release.
         self._held_keys: dict[str, float] = {}
         self._held_buttons: dict[str, float] = {}
+        self._supervised: set[str] = set()
         self._cursor: tuple[int, int] = (0, 0)
         self._clipboard_tool = _detect_clipboard_tool()
 
@@ -204,6 +205,7 @@ class Executor:
         user's keyboard then behaves bizarrely until they press and release it manually.
         """
         released: list[str] = []
+        self._supervised.clear()
         if self.dry_run:
             self._held_keys.clear()
             self._held_buttons.clear()
@@ -226,14 +228,36 @@ class Executor:
             self._held_buttons.clear()
         return released
 
+    def supervise(self, names: Iterable[str]) -> None:
+        """Exempt these from the hold watchdog while something is actively driving them.
+
+        The watchdog exists for input nobody is watching -- a burst that ended with `d:`
+        and no matching `u:`, or one interrupted between the two. A latched hold reflex is
+        the opposite case: its key is re-evaluated twenty times a second and released on
+        the guard going false, on leaving the state, on pause and on stop. Letting a 4 s
+        timer pull it out from under a guard that still wants it down would break exactly
+        the case latches exist for, and silently -- the latch would still believe it was
+        engaged, so it would never press again.
+        """
+        self._supervised.update(names)
+
+    def unsupervise(self, names: Iterable[str]) -> None:
+        self._supervised.difference_update(names)
+
     def enforce_hold_watchdog(self) -> list[str]:
         """Release anything held longer than `max_hold_ms`. Called once per cycle."""
         if self.max_hold_ms <= 0:
             return []
         now = time.monotonic()
         limit = self.max_hold_ms / 1000.0
-        stale = [k for k, t in self._held_keys.items() if now - t > limit]
-        stale_btn = [b for b, t in self._held_buttons.items() if now - t > limit]
+        stale = [
+            k for k, t in self._held_keys.items()
+            if now - t > limit and k not in self._supervised
+        ]
+        stale_btn = [
+            b for b, t in self._held_buttons.items()
+            if now - t > limit and f"btn:{b}" not in self._supervised
+        ]
         if not stale and not stale_btn:
             return []
         released: list[str] = []
@@ -250,12 +274,32 @@ class Executor:
 
     # -- execution -------------------------------------------------------------------
 
-    def run(self, burst: Burst, *, label: str = "") -> ExecutionReport:
+    def run(
+        self, burst: Burst, *, label: str = "", wait_s: float | None = None
+    ) -> ExecutionReport:
+        """Run a burst, optionally giving up if the device is busy.
+
+        `wait_s` bounds how long to wait for the execution lock. It exists for reflexes.
+        A reflex that fires while a 500 ms actuator burst is in flight would otherwise
+        queue behind it and land half a second after the condition that triggered it --
+        and a reaction delivered that late is not merely useless, it is a reaction to a
+        situation that has already resolved, applied to whatever is happening now. Timing
+        out and journalling the miss is the correct outcome; the next tick is 50 ms away.
+
+        Releases must never pass a timeout. Letting go is the safe direction, and a
+        dropped release is a key left down on the user's desktop.
+        """
         report = ExecutionReport(dry_run=self.dry_run)
         if not burst.actions:
             return report
 
-        with self._lock:
+        if not self._lock.acquire(timeout=wait_s if wait_s is not None else -1):
+            report.ok = False
+            report.error = "input busy: another burst was still running"
+            self._emit("busy", {"label": label, "source": burst.source, "waited_s": wait_s})
+            return report
+
+        try:
             if self._abort.is_set():
                 report.ok = False
                 report.aborted = True
@@ -303,9 +347,19 @@ class Executor:
 
             keys, buttons = self.held()
             report.held_keys, report.held_buttons = keys, buttons
+        finally:
+            self._lock.release()
 
         self._emit("burst", {"label": label, "source": burst.source, **report.as_dict()})
         return report
+
+    def held_names(self) -> set[str]:
+        """Everything down right now, as guard-visible names (`w`, `btn:l`).
+
+        Feeds `held()` in a guard expression, which is how a rule avoids re-pressing what
+        a latch already holds.
+        """
+        return set(self._held_keys) | {f"btn:{b}" for b in self._held_buttons}
 
     def _dispatch(self, action: object, cursor: float) -> float:
         if isinstance(action, Wait):
