@@ -224,7 +224,13 @@ class App:
                 "Install wl-clipboard."
             )
 
+        from .capture.a11y import a11y_available
         from .capture.probes import ocr_available
+
+        a11y_ok, a11y_detail = a11y_available()
+        report["accessibility"] = {"available": a11y_ok}
+        if not a11y_ok:
+            report["accessibility"]["detail"] = a11y_detail
 
         ocr_ok, ocr_detail = ocr_available()
         backends = detect_backends()

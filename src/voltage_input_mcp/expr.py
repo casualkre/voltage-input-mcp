@@ -171,6 +171,21 @@ def _fn_rate(ctx: GuardContext, name: str, default: float = 0.0) -> float:
     return _fn_probe(ctx, f"{name}__rate", default)
 
 
+def _fn_ui(ctx: GuardContext, name: str) -> bool:
+    """True if a control whose name contains `name` is published on the a11y bus.
+
+    Case-insensitive substring, because window titles and buttons carry decoration the
+    playbook author will not reproduce exactly -- "Save" should match "Save As...".
+
+    Prefer this over `sees()` for desktop work. `sees()` asks a 3B model to recognise a
+    screenshot and answers from a closed vocabulary; this asks the application and gets
+    the widget's actual name. It reports nothing at all for games, which draw their own
+    UI and publish no tree.
+    """
+    want = name.strip().lower()
+    return any(want in candidate for candidate in ctx.ui_names)
+
+
 def _fn_tune(ctx: GuardContext, name: str, default: float = 0.0) -> float:
     """A constant the optimiser is allowed to move.
 
@@ -239,6 +254,7 @@ _CTX_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "tune": _fn_tune,
     "var": _fn_var,
     "held": _fn_held,
+    "ui": _fn_ui,
     "latched": _fn_latched,
     "elapsed": _fn_elapsed,
     "cycles": _fn_cycles,
@@ -293,6 +309,11 @@ class GuardContext:
     # rule cannot tell whether it already did the thing it is about to do again.
     held: set[str] = field(default_factory=set)
     latched: set[str] = field(default_factory=set)
+    # Control names the desktop's accessibility bus is publishing right now. Unlike
+    # `elements`, these are not a model's opinion about a screenshot -- they are what the
+    # application itself says its widgets are called, so `ui('Save')` cannot be a
+    # hallucination the way `sees('save button')` can.
+    ui_names: set[str] = field(default_factory=set)
     # Constants the episodic optimiser is currently proposing. Read through `tune()`,
     # which falls back to the literal default when a playbook declares no tunables at
     # all -- so a guard written with tune() works identically with the search switched

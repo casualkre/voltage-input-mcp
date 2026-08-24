@@ -410,6 +410,21 @@ class Perception(BaseModel):
         snapped = (max(28, round(w / 28) * 28), max(28, round(h / 28) * 28))
         return snapped
     read_text: bool = Field(default=True, description="ask the VLM to transcribe key text")
+    accessibility: bool = Field(
+        default=False,
+        description=(
+            "also read the desktop's accessibility tree, merging its controls into the "
+            "observation and exposing them to the `ui(name)` guard. For desktop work this "
+            "is strictly better than the vision model: the names come from the "
+            "applications themselves, so they cannot be confabulated. Costs ~400 ms for a "
+            "full walk, cached for a fraction of a second and run on a worker. Off by "
+            "default because it reports nothing for games -- anything drawing its own UI "
+            "into a GL surface publishes no tree -- and a sensor that returns nothing is "
+            "not worth the walk. Under Wayland only some controls report usable screen "
+            "coordinates; ungrounded ones are still exact for `ui()` and are excluded "
+            "from the clickable element list."
+        ),
+    )
     region: Rect | None = Field(
         default=None, description="crop the capture before perception; cheaper and sharper"
     )

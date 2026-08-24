@@ -56,7 +56,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-__all__ = ["PolicyCache", "CacheEntry", "situation_key"]
+__all__ = ["PolicyCache", "CacheEntry", "situation_key", "fingerprint_of"]
 
 # Two situations count as the same when their normalised probe vectors are within this
 # distance. Deliberately small: 0.06 over a range-normalised vector is a few percent of
@@ -74,6 +74,13 @@ _PENALTY_LIMIT = 2
 # cache usable before it has observed a probe's full range -- see `_scale`.
 _MIN_RELATIVE_SPAN = 0.5
 _EPS = 1e-9
+# Mean per-cell drift, on a 0-1 fingerprint, above which the screen is considered to be
+# showing something else regardless of what the readings say. Loose enough to tolerate an
+# animating HUD or a moving background; tight enough to separate a fall from a menu.
+_VISUAL_TOLERANCE = 0.12
+# Fingerprint grid. Small on purpose: this is a "is this broadly the same screen" check,
+# not a comparison, and a big one would make every frame differ from every other.
+FINGERPRINT_W, FINGERPRINT_H = 8, 5
 
 
 def situation_key(
@@ -94,6 +101,11 @@ class CacheEntry:
     burst: str
     proposed_state: str | None
     note: str
+    # A coarse visual fingerprint of the screen when this decision was made. The second
+    # opinion: probe readings can coincide while the screen is showing something else
+    # entirely, and a decision recalled on that coincidence is a wrong input to a live
+    # game. See `lookup` for why disagreement is treated as a miss rather than resolved.
+    fingerprint: list[float] | None = None
     hits: int = 0
     penalties: int = 0
     created: float = field(default_factory=time.monotonic)
@@ -111,11 +123,13 @@ class PolicyCache:
         max_entries: int = _MAX_ENTRIES,
         seed: int | None = None,
         enabled: bool = True,
+        visual_tolerance: float = _VISUAL_TOLERANCE,
     ) -> None:
         self.radius = radius
         self.bypass = bypass
         self.max_entries = max_entries
         self.enabled = enabled
+        self.visual_tolerance = visual_tolerance
         self._rng = random.Random(seed)
         self._buckets: dict[tuple, list[CacheEntry]] = {}
         # Per-probe observed range, for normalisation. Seeded from the first value seen
@@ -128,6 +142,7 @@ class PolicyCache:
         self.stored = 0
         self.evicted = 0
         self.retired = 0
+        self.conflicts = 0
 
     # -- normalisation ---------------------------------------------------------------
 
@@ -181,8 +196,30 @@ class PolicyCache:
 
     # -- the loop --------------------------------------------------------------------
 
-    def lookup(self, key: tuple, vector: dict[str, float]) -> CacheEntry | None:
-        """The nearest stored decision for this situation, or None to ask the model."""
+    def lookup(
+        self,
+        key: tuple,
+        vector: dict[str, float],
+        *,
+        fingerprint: list[float] | None = None,
+    ) -> CacheEntry | None:
+        """The nearest stored decision for this situation, or None to ask the model.
+
+        Recall requires *corroboration*, not a single close reading. The exact key must
+        match, the probe vector must be within the radius, and -- when both sides have one
+        -- the visual fingerprint must agree too. When the signals disagree the answer is
+        None: fall back to the model rather than resolving the conflict in favour of the
+        cheap option.
+
+        This is the one place where the safe default is not obvious, so it is worth being
+        explicit. Probe readings can coincide while the screen is showing something
+        completely different -- an altitude of 200 m during a fall and an altitude of
+        200 m on a results screen are the same number and not the same situation. A
+        single-signal cache proceeds on that coincidence and sends a burst into the wrong
+        context, which for a live game is a real input at a real moment. Treating
+        disagreement as a miss costs one model call. Treating it as a hit costs a wrong
+        action, and the cache would then store the outcome and do it again.
+        """
         if not self.enabled:
             return None
         self.observe(vector)
@@ -208,10 +245,35 @@ class PolicyCache:
             self.misses += 1
             return None
 
+        if not self._corroborated(best, fingerprint):
+            # The readings say yes and the screen says no. Ask the model.
+            self.conflicts += 1
+            self.misses += 1
+            return None
+
         best.hits += 1
         best.last_used = time.monotonic()
         self.hits += 1
         return best
+
+    def _corroborated(
+        self, entry: CacheEntry, fingerprint: list[float] | None
+    ) -> bool:
+        """Does a second signal agree that this is the same situation?
+
+        Absence of evidence is not treated as disagreement: an entry stored before
+        fingerprinting was available, or a caller that cannot produce one, falls back to
+        the probe distance alone rather than never hitting. What is rejected is *positive*
+        disagreement, which is the case that matters.
+        """
+        if fingerprint is None or entry.fingerprint is None:
+            return True
+        if len(fingerprint) != len(entry.fingerprint):
+            return True
+        a = entry.fingerprint
+        b = fingerprint
+        drift = sum(abs(x - y) for x, y in zip(a, b, strict=True)) / len(a)
+        return drift <= self.visual_tolerance
 
     def store(
         self,
@@ -221,6 +283,7 @@ class PolicyCache:
         burst: str,
         proposed_state: str | None = None,
         note: str = "",
+        fingerprint: list[float] | None = None,
     ) -> None:
         """Remember a decision that actually worked.
 
@@ -242,6 +305,7 @@ class PolicyCache:
                 entry.burst = burst
                 entry.proposed_state = proposed_state
                 entry.note = note
+                entry.fingerprint = fingerprint
                 entry.penalties = 0
                 entry.last_used = time.monotonic()
                 return
@@ -250,6 +314,7 @@ class PolicyCache:
             CacheEntry(
                 vector=dict(vector), burst=burst,
                 proposed_state=proposed_state, note=note,
+                fingerprint=fingerprint,
             )
         )
         self.stored += 1
@@ -308,9 +373,29 @@ class PolicyCache:
             "bypasses": self.bypasses,
             "retired": self.retired,
             "evicted": self.evicted,
+            # Times the readings said "same situation" and the screen disagreed. A
+            # non-zero count here is the corroboration check earning its keep.
+            "conflicts": self.conflicts,
             # The number that says whether this is doing anything: the share of decisions
             # answered without a model round trip.
             "hit_rate": round(self.hits / asked, 3) if asked else None,
             "radius": self.radius,
             "bypass": self.bypass,
         }
+
+
+def fingerprint_of(pixels) -> list[float]:
+    """A tiny luma thumbnail of the screen, flattened to 0-1.
+
+    Deliberately coarse. The question is "is this broadly the same screen", and a
+    high-resolution fingerprint answers "is this the identical frame", which is never true
+    and would make the check reject everything.
+    """
+    import numpy as np
+
+    h, w = pixels.shape[:2]
+    step_y = max(1, h // FINGERPRINT_H)
+    step_x = max(1, w // FINGERPRINT_W)
+    sub = pixels[::step_y, ::step_x][:FINGERPRINT_H, :FINGERPRINT_W]
+    luma = sub.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return (luma / 255.0).flatten().tolist()

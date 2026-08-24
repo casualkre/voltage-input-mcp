@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from ..capture import CaptureBackend, Frame, ProbeEngine, encode_png
+from ..capture.a11y import A11ySource
 from ..errors import Aborted, BurstParseError, ExpressionError, SessionError
 from ..expr import GuardContext
 from ..inputs import DeviceSet, ExecutionReport, Executor
@@ -64,7 +65,7 @@ from ..models.template import BurstTemplate
 from ..safety import Governor, KillSwitch, Verdict
 from .journal import CycleRecord, Journal
 from .prompts import ACTUATOR_SYSTEM, VISION_SYSTEM, actuator_prompt, vision_prompt
-from .recall import CacheEntry, PolicyCache, situation_key
+from .recall import CacheEntry, PolicyCache, fingerprint_of, situation_key
 from .tuner import Tunable, Tuner
 
 __all__ = ["Session", "SessionOptions", "SessionDeps", "RunStatus"]
@@ -253,8 +254,16 @@ class Session:
 
         # Recall: the actuator's own past decisions, keyed by situation. Every hit is a
         # model round trip that does not happen.
+        # The desktop's own account of its widgets. Off unless a playbook asks, because
+        # a full walk costs ~400 ms and games publish nothing at all.
+        self.a11y = A11ySource(
+            enabled=any(
+                playbook.perception_for(name).accessibility for name in playbook.states
+            )
+        )
         self.recall = PolicyCache(enabled=self.options.recall_enabled)
         self._last_recall: tuple = ((), {})
+        self._last_print: list[float] | None = None
         self._timings: dict[str, list[float]] = {"capture": [], "vision": [], "actuator": [],
                                                  "execute": [], "cycle": [], "reflex": []}
 
@@ -793,9 +802,15 @@ class Session:
             frame = frame.crop(x - frame.origin[0], y - frame.origin[1], w, h)
         result.frame = frame
 
+        if settings.accessibility:
+            # Runs on a worker and is TTL-cached, so most cycles pay nothing. What it
+            # returns is not a model's opinion about a screenshot -- it is what the
+            # applications say their controls are called.
+            await asyncio.to_thread(self.a11y.snapshot)
+
         if not self._should_run_vision(settings, sample.frame):
-            result.observation = self._last_observation
-            result.source = "cache" if self._last_observation.elements else "skipped"
+            result.observation = self._merge_a11y(self._last_observation, settings)
+            result.source = "cache" if result.observation.elements else "skipped"
             return result
 
         t1 = time.perf_counter()
@@ -814,9 +829,35 @@ class Session:
         # that was never made, and `on_change` would then skip vision indefinitely.
         self.probes.mark_perceived(sample.frame)
         self._last_observation = observation
-        result.observation = observation
+        result.observation = self._merge_a11y(observation, settings)
         result.source = "vlm"
         return result
+
+    def _merge_a11y(self, observation: Observation, settings: Perception) -> Observation:
+        """Add accessibility controls to an observation as grounded elements.
+
+        Only controls with usable screen coordinates are added. An ungrounded one is
+        still exact about *what* it is -- `ui('Save')` sees it -- but has no position, and
+        putting it in the element list would let `g:N` resolve to a click at (0, 0).
+        Under Wayland that is most of the tree: measured here, 138 of 387.
+
+        Vision's elements come first so existing `g:` indices keep their meaning within a
+        cycle; accessibility appends rather than reorders.
+        """
+        if not settings.accessibility:
+            return observation
+        controls = [e for e in self.a11y.snapshot() if e.grounded]
+        if not controls:
+            return observation
+        from ..models.observation import Element
+
+        extra = [
+            Element(label=c.name, x=c.x, y=c.y, w=c.w, h=c.h, conf=1.0)
+            for c in controls[: max(0, settings.max_elements * 4)]
+        ]
+        return observation.model_copy(
+            update={"elements": [*observation.elements, *extra]}
+        )
 
     def _should_run_vision(self, settings: Perception, frame: Frame) -> bool:
         if settings.mode == "never":
@@ -901,8 +942,18 @@ class Session:
             state.name, [e.label for e in observation.elements], targets
         )
         recall_vector = self._recall_vector(percept.probes or self.probes.last)
+        # The corroborating signal. Probe readings can coincide while the screen shows
+        # something else entirely -- 200 m during a fall and 200 m on a results panel are
+        # the same number and not the same situation.
+        sample = self._sample
+        recall_print = (
+            fingerprint_of(sample.frame.pixels) if sample is not None else None
+        )
         self._last_recall = (recall_key, recall_vector)
-        remembered = self.recall.lookup(recall_key, recall_vector)
+        self._last_print = recall_print
+        remembered = self.recall.lookup(
+            recall_key, recall_vector, fingerprint=recall_print
+        )
         if remembered is not None:
             await self._replay_remembered(
                 remembered, observation, state, targets, centres, record
@@ -1019,6 +1070,7 @@ class Session:
                 burst=burst_str,
                 proposed_state=proposed if proposed in targets else None,
                 note=note,
+                fingerprint=self._last_print,
             )
 
         # The actuator may only propose transitions the state already declares; the
@@ -1324,6 +1376,7 @@ class Session:
             held=self.deps.executor.held_names(),
             latched=set(self._latched),
             tunables=self._tune_params,
+            ui_names={c.name.lower() for c in self.a11y.snapshot()},
             state={
                 "name": self.state_name,
                 "cycles": self._cycles_in_state,
@@ -1497,6 +1550,7 @@ class Session:
             "reflex": self.reflex_summary(),
             "tuner": self.tuner_summary(),
             "recall": self.recall.stats(),
+            "accessibility": self.a11y.stats(),
             "held": sorted(self.deps.executor.held_names()),
             "elapsed_s": round(elapsed, 1),
             "vars": dict(self.vars),

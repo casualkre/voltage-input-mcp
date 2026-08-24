@@ -85,6 +85,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 print(f"               {line}")
     else:
         print("  fast loop    off -- reflexes fold back into the decision cycle")
+    a11y = report.get("accessibility", {})
+    if a11y.get("available"):
+        print("  a11y bus     ok -- set perception.accessibility for exact desktop elements")
+    else:
+        print("  a11y bus     unavailable (desktop control falls back to vision)")
+        if a11y.get("detail"):
+            for line in _wrapped(a11y["detail"], 62):
+                print(f"               {line}")
     print(f"  ocr          {'ok' if cap.get('ocr') else 'FAIL -- number probes disabled'}")
     if cap.get("ocr_detail"):
         print(f"               {cap['ocr_detail']}")

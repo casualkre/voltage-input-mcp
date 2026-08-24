@@ -263,3 +263,57 @@ async def test_a_session_stops_calling_the_actuator_for_situations_it_has_seen()
     # doing nothing would pass every assertion above.
     assert ("space", True) in sink.keys
     assert sink.keys.count(("space", True)) > 1
+
+
+# -- corroboration: the readings are not enough on their own -------------------------------
+
+
+def test_matching_readings_on_a_different_screen_are_refused():
+    """The failure this exists to prevent.
+
+    200 m during a fall and 200 m on a results panel are the same reading and not the
+    same situation. A single-signal cache proceeds on that coincidence and fires a burst
+    into the wrong context -- a real input at a real moment in a live game.
+    """
+    c = cache()
+    falling = [0.1] * 40
+    results_panel = [0.9] * 40
+    c.store(KEY, {"meters": 200.0}, burst="k:shift", fingerprint=falling)
+
+    assert c.lookup(KEY, {"meters": 200.0}, fingerprint=falling) is not None
+    assert c.lookup(KEY, {"meters": 200.0}, fingerprint=results_panel) is None
+    assert c.conflicts == 1
+
+
+def test_a_moving_background_still_counts_as_the_same_screen():
+    """Tolerance has to survive an animating HUD, or nothing ever hits."""
+    import random
+
+    rng = random.Random(2)
+    c = cache()
+    base = [rng.random() for _ in range(40)]
+    jittered = [min(1.0, max(0.0, v + rng.uniform(-0.05, 0.05))) for v in base]
+    c.store(KEY, {"meters": 200.0}, burst="k:shift", fingerprint=base)
+    assert c.lookup(KEY, {"meters": 200.0}, fingerprint=jittered) is not None
+
+
+def test_absent_evidence_is_not_treated_as_disagreement():
+    """An entry stored before fingerprinting, or a caller that has none, must still hit."""
+    c = cache()
+    c.store(KEY, {"meters": 200.0}, burst="k:shift")  # no fingerprint
+    assert c.lookup(KEY, {"meters": 200.0}, fingerprint=[0.5] * 40) is not None
+    c2 = cache()
+    c2.store(KEY, {"meters": 200.0}, burst="k:shift", fingerprint=[0.5] * 40)
+    assert c2.lookup(KEY, {"meters": 200.0}) is not None
+
+
+def test_a_fingerprint_is_coarse_enough_to_generalise():
+    """A high-resolution print answers "identical frame", which is never true."""
+    import numpy as np
+
+    from voltage_input_mcp.runtime.recall import FINGERPRINT_H, FINGERPRINT_W, fingerprint_of
+
+    frame = np.random.default_rng(3).integers(0, 255, (1080, 1920, 3), dtype=np.uint8)
+    print_ = fingerprint_of(frame)
+    assert len(print_) == FINGERPRINT_W * FINGERPRINT_H
+    assert all(0.0 <= v <= 1.0 for v in print_)
